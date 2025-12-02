@@ -72,9 +72,9 @@ SYSTEM_PROMPT = (
 
 SESSIONS: Dict[str, List[dict]] = {}
 
-MIN_UTTERANCE_MS = 600    # минимальная длина фразы, чтобы её распознавать
-END_SILENCE_MS = 500      # сколько тишины считать концом фразы
-ENERGY_THRESHOLD = 500    # порог "голос vs шум" (подбирается экспериментально)
+MIN_UTTERANCE_MS = 400    # минимальная длина фразы, чтобы её распознавать
+END_SILENCE_MS = 250      # сколько тишины считать концом фразы
+ENERGY_THRESHOLD = 400    # порог "голос vs шум" (подбирается экспериментально)
 
 # ---------- Вспомогательные функции ----------
 
@@ -172,6 +172,7 @@ def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) ->
         model=OPENAI_MODEL,
         messages=history,
         temperature=0.3,
+        max_tokens=64,
     )
     answer = resp.choices[0].message.content
 
