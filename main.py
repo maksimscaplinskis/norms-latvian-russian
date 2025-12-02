@@ -1,14 +1,14 @@
 import os
 import base64
 import uuid
+import json
 from typing import Dict, List
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 import azure.cognitiveservices.speech as speechsdk  # Speech SDK
 from openai import OpenAI  # v1 OpenAI client (Foundry / Azure OpenAI v1)
-
 
 # ---------- Конфигурация из переменных окружения ----------
 
@@ -191,21 +191,65 @@ async def dialog(payload: dict):
 
 # Пока заглушка – потом сюда прикрутим Twilio
 @app.post("/voice", response_class=PlainTextResponse)
-async def voice_webhook():
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+async def voice_webhook(request: Request):
+    # Берём текущий хост, чтобы не хардкодить домен
+    host = request.url.hostname
+    ws_url = f"wss://{host}/twilio-stream"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Voice gateway is not connected to Twilio yet.</Say>
+  <Connect>
+    <Stream url="{ws_url}">
+      <Parameter name="botSession" value="car-assistant" />
+    </Stream>
+  </Connect>
 </Response>"""
+
     return twiml
 
 
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
-    print("WS connected (stub, Twilio is not wired yet)")
+    print("Twilio WS connected")
+
+    call_sid = None
+    stream_sid = None
+
     try:
         while True:
-            data = await ws.receive_text()
-            print("WS message:", data[:200], "...")
+            msg = await ws.receive_text()
+            data = json.loads(msg)
+            event = data.get("event")
+
+            if event == "connected":
+                print("Twilio event=connected", data)
+
+            elif event == "start":
+                start_info = data.get("start", {})
+                call_sid = start_info.get("callSid")
+                stream_sid = start_info.get("streamSid")
+                print(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
+
+            elif event == "media":
+                media = data.get("media", {})
+                payload_b64 = media.get("payload")
+                chunk = media.get("chunk")
+                ts = media.get("timestamp")
+                # Здесь дальше будет распознавание Azure Speech.
+                # Сейчас просто слегка логируем, чтобы не спамить.
+                # print(f"Media chunk={chunk}, ts={ts}, len={len(payload_b64)}")
+
+            elif event == "stop":
+                print(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
+                break
+
+            else:
+                print("Twilio event other:", event)
+
+    except WebSocketDisconnect:
+        print("Twilio WS disconnected")
     except Exception as e:
-        print("WS closed:", e)
+        print("Twilio WS error:", e)
+    finally:
+        await ws.close()
