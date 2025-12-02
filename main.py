@@ -4,7 +4,8 @@ import uuid
 import json
 import logging
 import audioop
-from typing import Dict, List, Tuple
+import asyncio
+from typing import Dict, List, Tuple, Optional, Callable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -27,7 +28,7 @@ DEFAULT_VOICE = os.environ.get("SPEECH_VOICE", "en-US-AmandaMultilingualNeural")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")  # https://...services.ai.azure.com/openai/v1/
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL")        # deployment name, напр. car-assistant-gpt4o
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL")        # deployment name, напр. car-assistant-mini
 
 if not SPEECH_KEY or not SPEECH_REGION:
     logger.warning("SPEECH_KEY or SPEECH_REGION is not set")
@@ -37,11 +38,16 @@ if not (OPENAI_API_KEY and OPENAI_BASE_URL and OPENAI_MODEL):
                    "(OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL)")
 
 
+# ---------- Параметры "живости" диалога ----------
+
+ENERGY_THRESHOLD = 400   # порог энергии (для грубого детектора "клиент говорит")
+USER_TALKING_HOLD_MS = 400  # сколько мс после голоса считать, что клиент всё ещё говорит
+
 # ---------- Инициализация клиентов ----------
 
 app = FastAPI()
 
-# TTS (HTTP) – обычный wav
+# TTS (HTTP) – обычный wav (для тестовых эндпоинтов)
 speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
 speech_config.speech_synthesis_voice_name = DEFAULT_VOICE
 
@@ -67,14 +73,12 @@ openai_client = OpenAI(
 SYSTEM_PROMPT = (
     "Tu esi draudzīgs un profesionāls virtuālais asistents autoservisā. "
     "Atbildi īsi, skaidri un vienkāršā valodā. "
-    "Ja lietotājs runā krieviski, atbildi krieviski; ja latviski – atbildi latviski."
+    "Ja lietotājs runā krieviski, atbildi krieviski; ja latviski – atbildi latviski. "
+    "Atbildes garums – ne vairāk par 1–2 īsiem teikumiem."
 )
 
 SESSIONS: Dict[str, List[dict]] = {}
 
-MIN_UTTERANCE_MS = 400    # минимальная длина фразы, чтобы её распознавать
-END_SILENCE_MS = 250      # сколько тишины считать концом фразы
-ENERGY_THRESHOLD = 400    # порог "голос vs шум" (подбирается экспериментально)
 
 # ---------- Вспомогательные функции ----------
 
@@ -94,10 +98,10 @@ def synthesize_to_bytes(text: str) -> bytes:
         raise RuntimeError(msg)
 
 
-def synthesize_mulaw_base64_for_twilio(text: str) -> str:
+def synthesize_mulaw_bytes_for_twilio(text: str) -> bytes:
     """
     Синтезирует речь в формате raw-8khz-8bit-mono-mulaw
-    и возвращает base64-строку, готовую для Twilio media.payload.
+    и возвращает байты (без WAV-заголовка).
     """
     synthesizer = speechsdk.SpeechSynthesizer(
         speech_config=twilio_speech_config,
@@ -106,64 +110,20 @@ def synthesize_mulaw_base64_for_twilio(text: str) -> str:
     result = synthesizer.speak_text_async(text).get()
 
     if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        audio_bytes = result.audio_data  # raw μ-law
-        return base64.b64encode(audio_bytes).decode("ascii")
+        return result.audio_data  # raw μ-law 8kHz
     else:
         details = getattr(result, "cancellation_details", None)
         msg = str(details.reason) if details else "Unknown TTS error for Twilio"
         raise RuntimeError(msg)
 
 
-def recognize_text_from_mulaw_bytes(mulaw_bytes: bytes) -> Tuple[str, str]:
-    """
-    Принимает байты в формате 8kHz μ-law (как шлёт Twilio),
-    конвертит в 16-bit PCM и отдаёт в Azure STT.
-    Возвращает (text, detected_language), где language ∈ { 'lv-LV', 'ru-RU', '' }.
-    """
-    if not mulaw_bytes:
-        return "", ""
-
-    # μ-law -> 16-bit PCM (2 байта на сэмпл)
-    pcm16 = audioop.ulaw2lin(mulaw_bytes, 2)
-
-    # 8kHz, 16-bit, mono PCM
-    audio_format = speechsdk.audio.AudioStreamFormat(
-        samples_per_second=8000,
-        bits_per_sample=16,
-        channels=1,
-    )
-
-    push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
-    push_stream.write(pcm16)
-    push_stream.close()
-
-    audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
-
-    recognizer = speechsdk.SpeechRecognizer(
-        speech_config=stt_speech_config,
-        audio_config=audio_config,
-        auto_detect_source_language_config=AUTO_DETECT_CONFIG,
-    )
-
-    result = recognizer.recognize_once_async().get()
-
-    if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-        text = result.text or ""
-        auto_result = speechsdk.AutoDetectSourceLanguageResult(result)
-        detected_language = auto_result.language or ""
-        return text, detected_language
-    else:
-        return "", ""
-
-
-def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) -> Tuple[str, str]:
+def run_dialog_turn(session_id: str, user_text: str, lang: Optional[str] = None) -> Tuple[str, str]:
     """
     Одна реплика диалога: добавляем user_text в историю, вызываем GPT,
     сохраняем ответ. Возвращает (answer, session_id).
     """
     history = SESSIONS.get(session_id)
     if not history:
-        # можем при желании менять system prompt в зависимости от lang
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     history.append({"role": "user", "content": user_text})
@@ -172,7 +132,7 @@ def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) ->
         model=OPENAI_MODEL,
         messages=history,
         temperature=0.3,
-        max_tokens=96,
+        max_tokens=64,  # короткие ответы
     )
     answer = resp.choices[0].message.content
 
@@ -182,7 +142,7 @@ def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) ->
     return answer, session_id
 
 
-# ---------- HTTP-эндпоинты ----------
+# ---------- HTTP-эндпоинты для теста ----------
 
 @app.get("/")
 async def root():
@@ -203,6 +163,7 @@ async def test_chat(payload: dict):
                 {"role": "user", "content": user_text},
             ],
             temperature=0.3,
+            max_tokens=64,
         )
         answer = resp.choices[0].message.content
         return {"answer": answer}
@@ -268,11 +229,14 @@ async def dialog(payload: dict):
         logger.error("Dialog HTTP error: %s", e, exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 # ---------- Twilio: вебхук + WebSocket ----------
 
-# Вебхук Twilio → возвращаем TwiML без приветствия, чтобы первым говорил клиент
 @app.post("/voice", response_class=PlainTextResponse)
 async def voice_webhook(request: Request):
+    """
+    Twilio webhook: без приветствия, клиент говорит первым.
+    """
     host = request.url.hostname
     ws_url = f"wss://{host}/twilio-stream"
 
@@ -287,20 +251,125 @@ async def voice_webhook(request: Request):
 
     return twiml
 
-# Вебхук Twilio → возвращаем TwiML без приветствия, чтобы первым говорил клиент
+
+async def conversation_loop(
+    ws: WebSocket,
+    recognized_queue: "asyncio.Queue[Tuple[str, str]]",
+    get_stream_sid: Callable[[], Optional[str]],
+    initial_session_id: Optional[str],
+    is_user_talking: Callable[[], bool],
+):
+    """
+    Асинхронный цикл:
+      - ждёт признанные фразы из Azure STT,
+      - для каждой делает GPT → TTS,
+      - отправляет аудио в Twilio кусками,
+      - обрезает ответ, если клиент снова заговорил (barge-in).
+    """
+    session_id = initial_session_id
+
+    try:
+        while True:
+            text, lang = await recognized_queue.get()
+
+            if not text or not text.strip():
+                continue
+
+            logger.info(f"STT final: text={text!r}, language={lang}")
+
+            # GPT-ответ
+            try:
+                if not session_id:
+                    session_id = str(uuid.uuid4())
+                answer, session_id = run_dialog_turn(session_id, text, lang)
+                logger.info(f"GPT answer: {answer!r}")
+            except Exception as e:
+                logger.error(f"GPT error: {e}", exc_info=True)
+                if lang == "ru-RU":
+                    answer = (
+                        "Сейчас у меня технические проблемы. "
+                        "Пожалуйста, коротко опишите, что происходит с вашей машиной."
+                    )
+                else:
+                    answer = (
+                        "Atvainojiet, man šobrīd ir tehniskas problēmas. "
+                        "Lūdzu, īsumā pastāstiet, kas notiek ar jūsu auto."
+                    )
+
+            # TTS → μ-law
+            try:
+                audio_bytes = synthesize_mulaw_bytes_for_twilio(answer)
+            except Exception as e:
+                logger.error(f"TTS for Twilio error: {e}", exc_info=True)
+                continue
+
+            stream_sid = get_stream_sid()
+            if not stream_sid:
+                logger.warning("No streamSid, cannot send audio")
+                continue
+
+            # Отправляем аудио порциями ~20 ms (160 байт μ-law на 8 kHz)
+            frame_size = 160  # 20 ms при 8 kHz и 8-bit μ-law
+            for i in range(0, len(audio_bytes), frame_size):
+                if is_user_talking():
+                    # Клиент заговорил – обрезаем остаток ответа
+                    logger.info("User started talking, cutting off TTS (barge-in)")
+                    break
+
+                frame = audio_bytes[i:i + frame_size]
+                if not frame:
+                    continue
+
+                payload = base64.b64encode(frame).decode("ascii")
+                reply = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload},
+                }
+                await ws.send_text(json.dumps(reply))
+                # выдерживаем реальное время воспроизведения
+                await asyncio.sleep(0.02)
+
+            logger.info("Sent TTS audio back to Twilio")
+
+    except asyncio.CancelledError:
+        logger.info("Conversation loop cancelled")
+    except Exception as e:
+        logger.error(f"Error in conversation loop: {e}", exc_info=True)
+
+
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
     logger.info("Twilio WS connected")
 
-    call_sid = None
-    stream_sid = None
-    session_id = None
+    call_sid: Optional[str] = None
+    stream_sid: Optional[str] = None
 
-    mulaw_buffer = bytearray()   # буфер одной фразы (μ-law)
-    utterance_start_ts = None    # когда началась фраза (по ts)
-    last_voice_ts = None         # последний момент, когда был голос
-    in_utterance = False         # сейчас пользователь говорит или нет
+    # Очередь фраз, признанных Azure STT (text, lang)
+    recognized_queue: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue()
+
+    # Стейт для детектора "клиент говорит"
+    shared_state = {
+        "last_voice_ts": 0,   # последний момент, когда была энергия > порога
+        "current_ts": 0,      # последний ts, который мы видели
+    }
+
+    def is_user_talking() -> bool:
+        # считаем, что клиент говорит, если недавно (последние USER_TALKING_HOLD_MS) был голос
+        return (
+            shared_state["last_voice_ts"] > 0
+            and (shared_state["current_ts"] - shared_state["last_voice_ts"]) <= USER_TALKING_HOLD_MS
+        )
+
+    # STT объекты
+    stt_stream: Optional[speechsdk.audio.PushAudioInputStream] = None
+    recognizer: Optional[speechsdk.SpeechRecognizer] = None
+
+    # таск диалога (STT → GPT → TTS)
+    conversation_task: Optional[asyncio.Task] = None
+
+    loop = asyncio.get_running_loop()
 
     try:
         while True:
@@ -315,105 +384,72 @@ async def twilio_stream(ws: WebSocket):
                 start_info = data.get("start", {})
                 call_sid = start_info.get("callSid")
                 stream_sid = start_info.get("streamSid")
-                session_id = call_sid  # используем callSid как session_id для GPT
                 logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
 
-            elif event == "media":
-                if not stream_sid:
-                    continue
+                # Инициализируем STT continuous
+                audio_format = speechsdk.audio.AudioStreamFormat(
+                    samples_per_second=8000,
+                    bits_per_sample=16,
+                    channels=1,
+                )
+                stt_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+                audio_config = speechsdk.audio.AudioConfig(stream=stt_stream)
 
+                recognizer = speechsdk.SpeechRecognizer(
+                    speech_config=stt_speech_config,
+                    audio_config=audio_config,
+                    auto_detect_source_language_config=AUTO_DETECT_CONFIG,
+                )
+
+                def recognized_cb(evt: speechsdk.SpeechRecognitionEventArgs):
+                    result = evt.result
+                    if result.reason == speechsdk.ResultReason.RecognizedSpeech and result.text:
+                        auto_result = speechsdk.AutoDetectSourceLanguageResult(result)
+                        lang = auto_result.language or ""
+                        text = result.text
+                        # передаём в очередь в event loop
+                        loop.call_soon_threadsafe(
+                            recognized_queue.put_nowait, (text, lang)
+                        )
+
+                recognizer.recognized.connect(recognized_cb)
+
+                # стартуем непрерывное распознавание (внутри своего потока)
+                def start_recognition():
+                    recognizer.start_continuous_recognition_async().get()
+
+                loop.run_in_executor(None, start_recognition)
+
+                # стартуем цикл диалога
+                conversation_task = asyncio.create_task(
+                    conversation_loop(
+                        ws,
+                        recognized_queue,
+                        get_stream_sid=lambda: stream_sid,
+                        initial_session_id=call_sid,
+                        is_user_talking=is_user_talking,
+                    )
+                )
+
+            elif event == "media":
                 media = data.get("media", {})
-                ts = int(media.get("timestamp", "0"))   # миллисекунды (шагами по 20)
+                ts = int(media.get("timestamp", "0"))
                 payload_b64 = media.get("payload")
-                if not payload_b64:
+
+                shared_state["current_ts"] = ts
+
+                if not payload_b64 or not stt_stream:
                     continue
 
                 mulaw_bytes = base64.b64decode(payload_b64)
+                # декодируем в PCM16 для Azure STT
+                pcm16 = audioop.ulaw2lin(mulaw_bytes, 2)
+                stt_stream.write(pcm16)
 
-                # для детектора тишины перекодируем текущий чанк в PCM
-                pcm16_chunk = audioop.ulaw2lin(mulaw_bytes, 2)
-                energy = audioop.max(pcm16_chunk, 2)  # простая оценка громкости
-
-                is_voice = energy > ENERGY_THRESHOLD
-
-                # --- Обновляем состояние utterance ---
-                if is_voice:
-                    # есть голос
-                    mulaw_buffer.extend(mulaw_bytes)
-                    if not in_utterance:
-                        # начало новой фразы
-                        in_utterance = True
-                        utterance_start_ts = ts
-                        logger.info(f"Utterance started at ts={ts}, energy={energy}")
-                    last_voice_ts = ts
-                else:
-                    # тишина
-                    if in_utterance and last_voice_ts is not None:
-                        # сколько тишины прошло с последнего голоса
-                        silence_duration = ts - last_voice_ts
-                        utterance_duration = last_voice_ts - (utterance_start_ts or last_voice_ts)
-
-                        # если фраза была достаточно длинной и тишина достаточная – считаем её законченной
-                        if (
-                            silence_duration >= END_SILENCE_MS
-                            and utterance_duration >= MIN_UTTERANCE_MS
-                            and len(mulaw_buffer) > 0
-                        ):
-                            logger.info(
-                                f"Utterance ended: dur={utterance_duration} ms, "
-                                f"silence={silence_duration} ms, bytes={len(mulaw_buffer)}"
-                            )
-
-                            # копируем буфер в локальную переменную и очищаем для следующей фразы
-                            utterance_mulaw = bytes(mulaw_buffer)
-                            mulaw_buffer.clear()
-                            in_utterance = False
-                            utterance_start_ts = None
-                            last_voice_ts = None
-
-                            # --- Здесь запускаем STT → GPT → TTS для одной фразы ---
-                            try:
-                                text, lang = recognize_text_from_mulaw_bytes(utterance_mulaw)
-                                logger.info(f"STT: text={text!r}, language={lang}")
-
-                                if not text:
-                                    # если ничего не распознали – мягкий фолбэк и продолжаем слушать
-                                    if lang == "ru-RU":
-                                        answer = (
-                                            "Я вас плохо услышала. "
-                                            "Повторите, пожалуйста, ещё раз."
-                                        )
-                                    else:
-                                        answer = (
-                                            "Es jūs slikti dzirdēju. "
-                                            "Lūdzu, pasakiet vēlreiz."
-                                        )
-                                else:
-                                    # есть текст – нормальный GPT-ответ
-                                    if not session_id:
-                                        session_id = str(uuid.uuid4())
-                                    answer, session_id = run_dialog_turn(session_id, text, lang)
-                                    logger.info(f"GPT answer: {answer!r}")
-
-                                # TTS → Twilio
-                                try:
-                                    twilio_payload = synthesize_mulaw_base64_for_twilio(answer)
-                                except Exception as e:
-                                    logger.error(f"TTS for Twilio error: {e}", exc_info=True)
-                                    continue
-
-                                reply = {
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {"payload": twilio_payload},
-                                }
-                                await ws.send_text(json.dumps(reply))
-                                logger.info("Sent TTS audio back to Twilio")
-
-                            except Exception as e:
-                                logger.error(f"Error in STT→GPT→TTS pipeline: {e}", exc_info=True)
-
-                        # если фраза слишком короткая или тишина мала — просто ждём следующего чанка
+                # оценка энергии для детектора "клиент говорит"
+                energy = audioop.max(pcm16, 2)
+                if energy > ENERGY_THRESHOLD:
+                    shared_state["last_voice_ts"] = ts
 
             elif event == "stop":
                 logger.info(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
@@ -427,4 +463,24 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         logger.error(f"Twilio WS error: {e}", exc_info=True)
     finally:
-        pass
+        # Останавливаем STT
+        if recognizer is not None:
+            try:
+                recognizer.stop_continuous_recognition_async().get()
+            except Exception as e:
+                logger.error(f"Error stopping recognizer: {e}", exc_info=True)
+        if stt_stream is not None:
+            try:
+                stt_stream.close()
+            except Exception:
+                pass
+
+        # Останавливаем цикл диалога
+        if conversation_task is not None:
+            conversation_task.cancel()
+            try:
+                await conversation_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("Twilio WS handler finished")
