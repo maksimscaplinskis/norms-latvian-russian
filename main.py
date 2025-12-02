@@ -171,7 +171,6 @@ def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) ->
     resp = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=history,
-        temperature=0.3,
     )
     answer = resp.choices[0].message.content
 
