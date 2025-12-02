@@ -267,23 +267,6 @@ async def dialog(payload: dict):
 # ---------- Twilio: вебхук + WebSocket ----------
 
 # Вебхук Twilio → возвращаем TwiML без приветствия, чтобы первым говорил клиент
-@app.post("/voice", response_class=PlainTextResponse)
-async def voice_webhook(request: Request):
-    host = request.url.hostname
-    ws_url = f"wss://{host}/twilio-stream"
-
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{ws_url}">
-      <Parameter name="botSession" value="car-assistant" />
-    </Stream>
-  </Connect>
-</Response>"""
-
-    return twiml
-
-
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
@@ -294,18 +277,19 @@ async def twilio_stream(ws: WebSocket):
     session_id = None
 
     audio_buffer = bytearray()
-    responded = False  # пока делаем один полный цикл STT→GPT→TTS за звонок
+    responded = False  # пока делаем один цикл STT→GPT→TTS за звонок
 
     try:
         while True:
             msg = await ws.receive_text()
-            logger.info(f"Twilio WS raw message: {msg[:200]}")
+            # убрали лог raw message, чтобы не спамить
 
             data = json.loads(msg)
             event = data.get("event")
 
             if event == "connected":
-                logger.info(f"Twilio event=connected: {data}")
+                # можно вообще убрать, но пусть раз в звонок будет
+                logger.info("Twilio event=connected")
 
             elif event == "start":
                 start_info = data.get("start", {})
@@ -315,8 +299,11 @@ async def twilio_stream(ws: WebSocket):
                 logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
 
             elif event == "media":
+                if responded or not stream_sid:
+                    # если мы уже ответили – просто игнорируем остальные чанки
+                    continue
+
                 media = data.get("media", {})
-                chunk = int(media.get("chunk", "0"))
                 ts = int(media.get("timestamp", "0"))
                 payload_b64 = media.get("payload")
 
@@ -324,45 +311,55 @@ async def twilio_stream(ws: WebSocket):
                     mulaw_bytes = base64.b64decode(payload_b64)
                     audio_buffer.extend(mulaw_bytes)
 
-                logger.info(
-                    f"Twilio media chunk={chunk}, ts={ts}, "
-                    f"payload_len={len(payload_b64) if payload_b64 else 0}, "
-                    f"buffer_size={len(audio_buffer)}"
-                )
-
-                # Как только клиент что-то сказал (первые пару секунд) – делаем один цикл
-                if (not responded) and ts >= 2000 and len(audio_buffer) > 0 and stream_sid:
+                # Как только прошло > 2 секунд и есть буфер – запускаем пайплайн
+                if ts >= 2000 and len(audio_buffer) > 0:
                     responded = True
+                    logger.info(">>> Starting STT → GPT → TTS pipeline")
 
                     try:
-                        # STT с автоопределением RU/LV
+                        # 1) STT + автоопределение языка
                         text, lang = recognize_text_from_mulaw_bytes(bytes(audio_buffer))
-                        logger.info(f"*** STT recognized text: {text!r}, language={lang}")
+                        logger.info(f"STT: text={text!r}, language={lang}")
 
-                        if text:
-                            # GPT-диалог через общую логику
-                            if not session_id:
-                                session_id = str(uuid.uuid4())
-
-                            answer, session_id = run_dialog_turn(session_id, text, lang)
-                            logger.info(f"*** GPT answer: {answer!r}")
-
-                            # TTS в μ-law для Twilio
-                            twilio_payload = synthesize_mulaw_base64_for_twilio(answer)
-
-                            reply = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {
-                                    "payload": twilio_payload
-                                },
-                            }
-
-                            await ws.send_text(json.dumps(reply))
-                            logger.info("Sent GPT+TTS audio back to Twilio")
-
+                        if not text:
+                            logger.info("STT: empty text, using fallback reply")
+                            answer = (
+                                "Es jūs ļoti slikti dzirdu. "
+                                "Lūdzu, pasakiet vēlreiz, kas notiek ar jūsu mašīnu."
+                            )
                         else:
-                            logger.info("STT returned empty text – not sending response")
+                            # 2) GPT
+                            try:
+                                if not session_id:
+                                    session_id = str(uuid.uuid4())
+
+                                answer, session_id = run_dialog_turn(session_id, text, lang)
+                                logger.info(f"GPT answer: {answer!r}")
+                            except Exception as e:
+                                logger.error(f"GPT error: {e}", exc_info=True)
+                                answer = (
+                                    "Atvainojiet, man šobrīd ir tehniskas problēmas. "
+                                    "Lūdzu, īsumā pastāstiet par problēmu ar auto."
+                                )
+
+                        # 3) TTS → μ-law
+                        try:
+                            twilio_payload = synthesize_mulaw_base64_for_twilio(answer)
+                        except Exception as e:
+                            logger.error(f"TTS for Twilio error: {e}", exc_info=True)
+                            continue
+
+                        # 4) Отправляем аудио в Twilio
+                        reply = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": twilio_payload
+                            },
+                        }
+
+                        await ws.send_text(json.dumps(reply))
+                        logger.info("Sent TTS audio back to Twilio")
 
                     except Exception as e:
                         logger.error(f"Error in STT→GPT→TTS pipeline: {e}", exc_info=True)
@@ -372,7 +369,9 @@ async def twilio_stream(ws: WebSocket):
                 break
 
             else:
-                logger.info(f"Twilio event other={event}: {data}")
+                # редкие другие события – можно вообще не логировать,
+                # но оставим на всякий случай
+                logger.info(f"Twilio event other={event}")
 
     except WebSocketDisconnect:
         logger.info("Twilio WS disconnected (WebSocketDisconnect)")
