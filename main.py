@@ -66,6 +66,18 @@ AUTO_DETECT_CONFIG = AutoDetectSourceLanguageConfig(
     languages=["lv-LV", "ru-RU"]
 )
 
+# Уменьшаем время "тишины в конце фразы", после которой STT отдаёт финальный текст
+stt_speech_config.set_property(
+    speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+    "300"  # 300 мс вместо дефолтных ~700–1500
+)
+
+# На всякий случай ограничим длинную начальную тишину
+stt_speech_config.set_property(
+    speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+    "3000"  # если абонент молчит > 3 сек, Azure всё равно завершит utterance
+)
+
 # OpenAI (Foundry / Azure OpenAI v1)
 openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
@@ -391,6 +403,8 @@ async def twilio_stream(ws: WebSocket):
 
     loop = asyncio.get_running_loop()
 
+    first_utterance_sent = {"value": False}
+
     try:
         while True:
             msg = await ws.receive_text()
@@ -405,6 +419,25 @@ async def twilio_stream(ws: WebSocket):
                 call_sid = start_info.get("callSid")
                 stream_sid = start_info.get("streamSid")
                 logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
+
+                initial_phrase = "Слушаю вас."  # или пустой бип, если сделаем заранее файл
+                try:
+                    audio_bytes = synthesize_mulaw_bytes_for_twilio(initial_phrase)
+                    frame_size = 160
+                    for i in range(0, len(audio_bytes), frame_size):
+                        frame = audio_bytes[i:i + frame_size]
+                        if not frame:
+                            continue
+                        payload = base64.b64encode(frame).decode("ascii")
+                        reply = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": payload},
+                        }
+                        await ws.send_text(json.dumps(reply))
+                        await asyncio.sleep(0.02)
+                except Exception as e:
+                    logger.error(f"Initial TTS error: {e}", exc_info=True)
 
                 # Инициализируем STT continuous
                 audio_format = speechsdk.audio.AudioStreamFormat(
@@ -432,7 +465,22 @@ async def twilio_stream(ws: WebSocket):
                             recognized_queue.put_nowait, (text, lang)
                         )
 
+                def recognizing_cb(evt: speechsdk.SpeechRecognitionEventArgs):
+                    # промежуточные результаты
+                    if first_utterance_sent["value"]:
+                        return  # для следующих фраз живём только на финалах
+
+                    result = evt.result
+                    if result.reason == speechsdk.ResultReason.RecognizingSpeech and result.text:
+                        text = result.text.strip()
+                        if len(text.replace(" ", "")) >= 3:
+                            auto_result = speechsdk.AutoDetectSourceLanguageResult(result)
+                            lang = auto_result.language or ""
+                            first_utterance_sent["value"] = True
+                            loop.call_soon_threadsafe(recognized_queue.put_nowait, (text, lang))
+
                 recognizer.recognized.connect(recognized_cb)
+                recognizer.recognizing.connect(recognizing_cb)
 
                 # стартуем непрерывное распознавание (внутри своего потока)
                 def start_recognition():
