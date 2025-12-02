@@ -40,8 +40,10 @@ if not (OPENAI_API_KEY and OPENAI_BASE_URL and OPENAI_MODEL):
 
 # ---------- Параметры "живости" диалога ----------
 
-ENERGY_THRESHOLD = 400   # порог энергии (для грубого детектора "клиент говорит")
-USER_TALKING_HOLD_MS = 400  # сколько мс после голоса считать, что клиент всё ещё говорит
+BASE_ENERGY_THRESHOLD = 800   # порог энергии (для грубого детектора "клиент говорит")
+USER_TALKING_HOLD_MS = 600  # сколько мс после голоса считать, что клиент всё ещё говорит
+NOISE_SMOOTHING = 0.98             # сглаживание среднего шума
+NOISE_VOICE_FACTOR = 3.0           # во сколько раз голос громче шума
 
 # ---------- Инициализация клиентов ----------
 
@@ -271,8 +273,17 @@ async def conversation_loop(
     try:
         while True:
             text, lang = await recognized_queue.get()
+            if not text:
+                continue
 
-            if not text or not text.strip():
+            text = text.strip()
+            if not text:
+                continue
+
+            # убираем совсем короткий мусор, типа "ну", "ээ", "ģd"
+            bare = text.replace(" ", "")
+            if len(bare) < 3:
+                logger.info(f"STT too short, ignoring: {text!r}")
                 continue
 
             logger.info(f"STT final: text={text!r}, language={lang}")
@@ -309,10 +320,16 @@ async def conversation_loop(
                 continue
 
             # Отправляем аудио порциями ~20 ms (160 байт μ-law на 8 kHz)
-            frame_size = 160  # 20 ms при 8 kHz и 8-bit μ-law
+            frame_size = 160  # 20 ms
+            tts_start = asyncio.get_running_loop().time()
+            min_tts_before_barge = 0.5  # 300 ms
+
             for i in range(0, len(audio_bytes), frame_size):
-                if is_user_talking():
-                    # Клиент заговорил – обрезаем остаток ответа
+                # сколько уже проиграли
+                elapsed = asyncio.get_running_loop().time() - tts_start
+
+                # даём минимум 300ms, потом разрешаем бардж-ин
+                if elapsed >= min_tts_before_barge and is_user_talking():
                     logger.info("User started talking, cutting off TTS (barge-in)")
                     break
 
@@ -327,7 +344,6 @@ async def conversation_loop(
                     "media": {"payload": payload},
                 }
                 await ws.send_text(json.dumps(reply))
-                # выдерживаем реальное время воспроизведения
                 await asyncio.sleep(0.02)
 
             logger.info("Sent TTS audio back to Twilio")
@@ -351,12 +367,16 @@ async def twilio_stream(ws: WebSocket):
 
     # Стейт для детектора "клиент говорит"
     shared_state = {
-        "last_voice_ts": 0,   # последний момент, когда была энергия > порога
-        "current_ts": 0,      # последний ts, который мы видели
+        "last_voice_ts": 0,
+        "current_ts": 0,
+        "noise_floor": 0.0,   # динамический уровень шума
     }
 
     def is_user_talking() -> bool:
-        # считаем, что клиент говорит, если недавно (последние USER_TALKING_HOLD_MS) был голос
+        # динамический порог
+        noise = shared_state["noise_floor"]
+        threshold = max(BASE_ENERGY_THRESHOLD, noise * NOISE_VOICE_FACTOR)
+
         return (
             shared_state["last_voice_ts"] > 0
             and (shared_state["current_ts"] - shared_state["last_voice_ts"]) <= USER_TALKING_HOLD_MS
@@ -442,13 +462,28 @@ async def twilio_stream(ws: WebSocket):
                     continue
 
                 mulaw_bytes = base64.b64decode(payload_b64)
-                # декодируем в PCM16 для Azure STT
                 pcm16 = audioop.ulaw2lin(mulaw_bytes, 2)
                 stt_stream.write(pcm16)
 
-                # оценка энергии для детектора "клиент говорит"
-                energy = audioop.max(pcm16, 2)
-                if energy > ENERGY_THRESHOLD:
+                # Оцениваем энергию текущего чанка
+                energy = audioop.rms(pcm16, 2)  # RMS чуть стабильнее, чем max
+
+                # Обновляем оценку шума (noise_floor) только для "не очень громких" сигналов
+                noise = shared_state["noise_floor"]
+                if noise == 0.0:
+                    noise = float(energy)
+                else:
+                    # если энергия не слишком сильно выше текущего шума — считаем это фоном
+                    if energy < noise * 1.5:
+                        noise = NOISE_SMOOTHING * noise + (1.0 - NOISE_SMOOTHING) * energy
+
+                shared_state["noise_floor"] = noise
+
+                # Динамический порог: либо базовый, либо шум * фактор
+                threshold = max(BASE_ENERGY_THRESHOLD, noise * NOISE_VOICE_FACTOR)
+
+                # Если энергия сильно выше шума — считаем, что клиент говорит
+                if energy > threshold:
                     shared_state["last_voice_ts"] = ts
 
             elif event == "stop":
