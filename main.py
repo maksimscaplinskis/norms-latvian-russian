@@ -72,6 +72,9 @@ SYSTEM_PROMPT = (
 
 SESSIONS: Dict[str, List[dict]] = {}
 
+MIN_UTTERANCE_MS = 600    # минимальная длина фразы, чтобы её распознавать
+END_SILENCE_MS = 500      # сколько тишины считать концом фразы
+ENERGY_THRESHOLD = 500    # порог "голос vs шум" (подбирается экспериментально)
 
 # ---------- Вспомогательные функции ----------
 
@@ -293,12 +296,10 @@ async def twilio_stream(ws: WebSocket):
     stream_sid = None
     session_id = None
 
-    audio_buffer = bytearray()
-    responded = False
-
-    stt_attempts = 0
-    max_stt_attempts = 3          # максимум 3 попытки
-    stt_interval_ms = 2000        # первая попытка через 2s, потом 4s, 6s
+    mulaw_buffer = bytearray()   # буфер одной фразы (μ-law)
+    utterance_start_ts = None    # когда началась фраза (по ts)
+    last_voice_ts = None         # последний момент, когда был голос
+    in_utterance = False         # сейчас пользователь говорит или нет
 
     try:
         while True:
@@ -317,89 +318,87 @@ async def twilio_stream(ws: WebSocket):
                 logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
 
             elif event == "media":
-                if responded or not stream_sid:
-                    # если уже ответили – игнорируем дальнейшие чанки
+                if not stream_sid:
                     continue
 
                 media = data.get("media", {})
-                ts = int(media.get("timestamp", "0"))
+                ts = int(media.get("timestamp", "0"))   # миллисекунды (шагами по 20)
                 payload_b64 = media.get("payload")
+                if not payload_b64:
+                    continue
 
-                if payload_b64:
-                    mulaw_bytes = base64.b64decode(payload_b64)
-                    audio_buffer.extend(mulaw_bytes)
+                mulaw_bytes = base64.b64decode(payload_b64)
 
-                # Проверяем, пора ли делать очередную попытку STT
-                # 1-я попытка при ts >= 2000, 2-я при ts >= 4000, 3-я при ts >= 6000
-                next_threshold = stt_interval_ms * (stt_attempts + 1)
+                # для детектора тишины перекодируем текущий чанк в PCM
+                pcm16_chunk = audioop.ulaw2lin(mulaw_bytes, 2)
+                energy = audioop.max(pcm16_chunk, 2)  # простая оценка громкости
 
-                if ts >= next_threshold and len(audio_buffer) > 0 and stt_attempts < max_stt_attempts:
-                    stt_attempts += 1
-                    logger.info(f"Starting STT attempt {stt_attempts}, ts={ts}, buffer_size={len(audio_buffer)}")
+                is_voice = energy > ENERGY_THRESHOLD
 
-                    try:
-                        text, lang = recognize_text_from_mulaw_bytes(bytes(audio_buffer))
-                        logger.info(f"STT: text={text!r}, language={lang}")
+                # --- Обновляем состояние utterance ---
+                if is_voice:
+                    # есть голос
+                    mulaw_buffer.extend(mulaw_bytes)
+                    if not in_utterance:
+                        # начало новой фразы
+                        in_utterance = True
+                        utterance_start_ts = ts
+                        logger.info(f"Utterance started at ts={ts}, energy={energy}")
+                    last_voice_ts = ts
+                else:
+                    # тишина
+                    if in_utterance and last_voice_ts is not None:
+                        # сколько тишины прошло с последнего голоса
+                        silence_duration = ts - last_voice_ts
+                        utterance_duration = last_voice_ts - (utterance_start_ts or last_voice_ts)
 
-                        if text:
-                            # Есть распознанный текст → GPT → TTS → ответ
-                            if not session_id:
-                                session_id = str(uuid.uuid4())
+                        # если фраза была достаточно длинной и тишина достаточная – считаем её законченной
+                        if (
+                            silence_duration >= END_SILENCE_MS
+                            and utterance_duration >= MIN_UTTERANCE_MS
+                            and len(mulaw_buffer) > 0
+                        ):
+                            logger.info(
+                                f"Utterance ended: dur={utterance_duration} ms, "
+                                f"silence={silence_duration} ms, bytes={len(mulaw_buffer)}"
+                            )
 
+                            # копируем буфер в локальную переменную и очищаем для следующей фразы
+                            utterance_mulaw = bytes(mulaw_buffer)
+                            mulaw_buffer.clear()
+                            in_utterance = False
+                            utterance_start_ts = None
+                            last_voice_ts = None
+
+                            # --- Здесь запускаем STT → GPT → TTS для одной фразы ---
                             try:
-                                answer, session_id = run_dialog_turn(session_id, text, lang)
-                                logger.info(f"GPT answer: {answer!r}")
-                            except Exception as e:
-                                logger.error(f"GPT error: {e}", exc_info=True)
-                                # Фолбэк, если GPT упал
-                                if lang == "ru-RU":
-                                    answer = (
-                                        "Сейчас у меня технические проблемы. "
-                                        "Пожалуйста, коротко опишите, что происходит с вашей машиной."
-                                    )
+                                text, lang = recognize_text_from_mulaw_bytes(utterance_mulaw)
+                                logger.info(f"STT: text={text!r}, language={lang}")
+
+                                if not text:
+                                    # если ничего не распознали – мягкий фолбэк и продолжаем слушать
+                                    if lang == "ru-RU":
+                                        answer = (
+                                            "Я вас плохо услышала. "
+                                            "Повторите, пожалуйста, ещё раз."
+                                        )
+                                    else:
+                                        answer = (
+                                            "Es jūs slikti dzirdēju. "
+                                            "Lūdzu, pasakiet vēlreiz."
+                                        )
                                 else:
-                                    answer = (
-                                        "Atvainojiet, man šobrīd ir tehniskas problēmas. "
-                                        "Lūdzu, īsumā pastāstiet, kas notiek ar jūsu auto."
-                                    )
+                                    # есть текст – нормальный GPT-ответ
+                                    if not session_id:
+                                        session_id = str(uuid.uuid4())
+                                    answer, session_id = run_dialog_turn(session_id, text, lang)
+                                    logger.info(f"GPT answer: {answer!r}")
 
-                            # TTS → Twilio
-                            try:
-                                twilio_payload = synthesize_mulaw_base64_for_twilio(answer)
-                            except Exception as e:
-                                logger.error(f"TTS for Twilio error: {e}", exc_info=True)
-                                continue
-
-                            reply = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": twilio_payload},
-                            }
-                            await ws.send_text(json.dumps(reply))
-                            logger.info("Sent TTS audio back to Twilio")
-                            responded = True
-
-                        else:
-                            # Пустой текст – если попытки ещё есть, просто ждём дальше
-                            if stt_attempts < max_stt_attempts:
-                                logger.info("STT empty, waiting for more audio before replying")
-                            else:
-                                # После нескольких пустых попыток – фолбэк по языку (если определился)
-                                if lang == "ru-RU":
-                                    answer = (
-                                        "Я вас плохо слышу. "
-                                        "Пожалуйста, повторите ещё раз, что происходит с вашей машиной."
-                                    )
-                                else:
-                                    answer = (
-                                        "Es jūs ļoti slikti dzirdu. "
-                                        "Lūdzu, pasakiet vēlreiz, kas notiek ar jūsu mašīnu."
-                                    )
-
+                                # TTS → Twilio
                                 try:
                                     twilio_payload = synthesize_mulaw_base64_for_twilio(answer)
                                 except Exception as e:
-                                    logger.error(f"TTS for Twilio error (fallback): {e}", exc_info=True)
+                                    logger.error(f"TTS for Twilio error: {e}", exc_info=True)
                                     continue
 
                                 reply = {
@@ -408,11 +407,12 @@ async def twilio_stream(ws: WebSocket):
                                     "media": {"payload": twilio_payload},
                                 }
                                 await ws.send_text(json.dumps(reply))
-                                logger.info("Sent fallback TTS audio back to Twilio")
-                                responded = True
+                                logger.info("Sent TTS audio back to Twilio")
 
-                    except Exception as e:
-                        logger.error(f"Error in STT→GPT→TTS pipeline: {e}", exc_info=True)
+                            except Exception as e:
+                                logger.error(f"Error in STT→GPT→TTS pipeline: {e}", exc_info=True)
+
+                        # если фраза слишком короткая или тишина мала — просто ждём следующего чанка
 
             elif event == "stop":
                 logger.info(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
