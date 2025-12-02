@@ -172,7 +172,6 @@ def run_dialog_turn(session_id: str, user_text: str, lang: str | None = None) ->
         model=OPENAI_MODEL,
         messages=history,
         temperature=0.3,
-        max_tokens=64,
     )
     answer = resp.choices[0].message.content
 
