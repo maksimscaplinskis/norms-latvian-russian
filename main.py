@@ -10,10 +10,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 import azure.cognitiveservices.speech as speechsdk
-from azure.cognitiveservices.speech.languageconfig import (
-    AutoDetectSourceLanguageConfig,
-    AutoDetectSourceLanguageResult,
-)
+from azure.cognitiveservices.speech.languageconfig import AutoDetectSourceLanguageConfig
 from openai import OpenAI
 
 
@@ -149,7 +146,7 @@ def recognize_text_from_mulaw_bytes(mulaw_bytes: bytes) -> Tuple[str, str]:
 
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
         text = result.text or ""
-        auto_result = AutoDetectSourceLanguageResult(result)
+        auto_result = speechsdk.AutoDetectSourceLanguageResult(result)
         detected_language = auto_result.language or ""
         return text, detected_language
     else:
@@ -266,7 +263,6 @@ async def dialog(payload: dict):
     except Exception as e:
         logger.error("Dialog HTTP error: %s", e, exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 # ---------- Twilio: вебхук + WebSocket ----------
 
