@@ -3,6 +3,7 @@ import base64
 import uuid
 import json
 from typing import Dict, List
+import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -32,6 +33,8 @@ if not (OPENAI_API_KEY and OPENAI_BASE_URL and OPENAI_MODEL):
 # ---------- Инициализация клиентов ----------
 
 app = FastAPI()
+
+logger = logging.getLogger("uvicorn.error")
 
 # Speech
 speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
@@ -211,7 +214,7 @@ async def voice_webhook(request: Request):
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
-    print("Twilio WS connected")
+    logger.info("Twilio WS connected")
 
     call_sid = None
     stream_sid = None
@@ -219,37 +222,41 @@ async def twilio_stream(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive_text()
+            logger.info(f"Twilio WS raw message: {msg[:200]}")
+
             data = json.loads(msg)
             event = data.get("event")
 
             if event == "connected":
-                print("Twilio event=connected", data)
+                logger.info(f"Twilio event=connected: {data}")
 
             elif event == "start":
                 start_info = data.get("start", {})
                 call_sid = start_info.get("callSid")
                 stream_sid = start_info.get("streamSid")
-                print(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
+                logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
 
             elif event == "media":
                 media = data.get("media", {})
                 payload_b64 = media.get("payload")
                 chunk = media.get("chunk")
                 ts = media.get("timestamp")
-                # Здесь дальше будет распознавание Azure Speech.
-                # Сейчас просто слегка логируем, чтобы не спамить.
-                # print(f"Media chunk={chunk}, ts={ts}, len={len(payload_b64)}")
+                # пока просто короткий лог, чтобы не заспамить
+                logger.info(
+                    f"Twilio media chunk={chunk}, ts={ts}, payload_len={len(payload_b64) if payload_b64 else 0}"
+                )
 
             elif event == "stop":
-                print(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
+                logger.info(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
                 break
 
             else:
-                print("Twilio event other:", event)
+                logger.info(f"Twilio event other={event}: {data}")
 
     except WebSocketDisconnect:
-        print("Twilio WS disconnected")
+        logger.info("Twilio WS disconnected (WebSocketDisconnect)")
     except Exception as e:
-        print("Twilio WS error:", e)
+        logger.error(f"Twilio WS error: {e}", exc_info=True)
     finally:
-        await ws.close()
+        # Можно не закрывать явно – Twilio сам закроет
+        pass
