@@ -40,6 +40,13 @@ logger = logging.getLogger("uvicorn.error")
 speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
 speech_config.speech_synthesis_voice_name = DEFAULT_VOICE
 
+# Speech для Twilio: 8kHz μ-law
+twilio_speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
+twilio_speech_config.speech_synthesis_voice_name = DEFAULT_VOICE
+twilio_speech_config.set_speech_synthesis_output_format(
+    speechsdk.SpeechSynthesisOutputFormat.Raw8Khz8BitMonoMULaw
+)
+
 # OpenAI (Foundry / Azure OpenAI v1 endpoint)
 openai_client = OpenAI(
     api_key=OPENAI_API_KEY,
@@ -55,6 +62,24 @@ SYSTEM_PROMPT = (
 # In-memory хранилище контекста по session_id (прототип)
 SESSIONS: Dict[str, List[dict]] = {}
 
+def synthesize_mulaw_base64_for_twilio(text: str) -> str:
+    """
+    Синтезирует речь в формате raw-8khz-8bit-mono-mulaw
+    и возвращает base64-строку, готовую для Twilio media.payload.
+    """
+    synthesizer = speechsdk.SpeechSynthesizer(
+        speech_config=twilio_speech_config,
+        audio_config=None,
+    )
+    result = synthesizer.speak_text_async(text).get()
+
+    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+        audio_bytes = result.audio_data  # raw μ-law 8kHz, без WAV заголовка
+        return base64.b64encode(audio_bytes).decode("ascii")
+    else:
+        details = getattr(result, "cancellation_details", None)
+        msg = str(details.reason) if details else "Unknown TTS error for Twilio"
+        raise RuntimeError(msg)
 
 # ---------- Вспомогательная функция для TTS ----------
 
@@ -218,6 +243,7 @@ async def twilio_stream(ws: WebSocket):
 
     call_sid = None
     stream_sid = None
+    responded = False  # чтобы ответить один раз
 
     try:
         while True:
@@ -238,13 +264,39 @@ async def twilio_stream(ws: WebSocket):
 
             elif event == "media":
                 media = data.get("media", {})
-                payload_b64 = media.get("payload")
                 chunk = media.get("chunk")
                 ts = media.get("timestamp")
-                # пока просто короткий лог, чтобы не заспамить
+                payload_b64 = media.get("payload")
                 logger.info(
                     f"Twilio media chunk={chunk}, ts={ts}, payload_len={len(payload_b64) if payload_b64 else 0}"
                 )
+
+                # --- ПРОСТОЙ ТЕСТОВЫЙ ОТВЕТ В ЗВОНКЕ ---
+                # Один раз за звонок синтезируем фразу и шлём её в Twilio
+                if not responded and stream_sid:
+                    responded = True
+
+                    # Здесь ТЕСТОВЫЙ текст – просто чтобы услышать голос
+                    tts_text = (
+                        "Sveiki! Šis ir tests. "
+                        "Es runāju caur Azure balss servisu, integrētu ar Twilio."
+                    )
+
+                    try:
+                        twilio_payload = synthesize_mulaw_base64_for_twilio(tts_text)
+
+                        reply = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": twilio_payload
+                            },
+                        }
+
+                        await ws.send_text(json.dumps(reply))
+                        logger.info("Sent TTS audio back to Twilio")
+                    except Exception as e:
+                        logger.error(f"Error sending TTS to Twilio: {e}", exc_info=True)
 
             elif event == "stop":
                 logger.info(f"Twilio stream STOP callSid={call_sid}, streamSid={stream_sid}")
@@ -258,5 +310,4 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         logger.error(f"Twilio WS error: {e}", exc_info=True)
     finally:
-        # Можно не закрывать явно – Twilio сам закроет
         pass
