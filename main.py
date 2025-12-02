@@ -267,6 +267,23 @@ async def dialog(payload: dict):
 # ---------- Twilio: вебхук + WebSocket ----------
 
 # Вебхук Twilio → возвращаем TwiML без приветствия, чтобы первым говорил клиент
+@app.post("/voice", response_class=PlainTextResponse)
+async def voice_webhook(request: Request):
+    host = request.url.hostname
+    ws_url = f"wss://{host}/twilio-stream"
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{ws_url}">
+      <Parameter name="botSession" value="car-assistant" />
+    </Stream>
+  </Connect>
+</Response>"""
+
+    return twiml
+
+# Вебхук Twilio → возвращаем TwiML без приветствия, чтобы первым говорил клиент
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
