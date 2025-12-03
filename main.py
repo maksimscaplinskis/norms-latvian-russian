@@ -2,11 +2,11 @@ import os
 import json
 import base64
 import logging
-import time
 import audioop
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
+from openai import AzureOpenAI
 
 import azure.cognitiveservices.speech as speechsdk
 
@@ -16,7 +16,6 @@ logger = logging.getLogger("twilio")
 app = FastAPI()
 
 # ====  Azure Speech общая конфигурация  ====
-
 SPEECH_KEY = os.getenv("SPEECH_KEY")
 SPEECH_REGION = os.getenv("SPEECH_REGION")
 
@@ -30,12 +29,100 @@ speech_config = speechsdk.SpeechConfig(
 
 # Авто-определение RU / LV
 auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
-    languages=["ru-RU", "lv-LV"]
+    languages=["lv-LV", "ru-RU"]
+)
+
+# ====  Azure OpenAI общая конфигурация  ====
+AZURE_OAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
+AZURE_OAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")  # пример
+
+if not AZURE_OAI_API_KEY or not AZURE_OAI_ENDPOINT:
+    logger.warning("Azure OpenAI credentials are not set!")
+
+oai_client = AzureOpenAI(
+    api_key=AZURE_OAI_API_KEY,
+    api_version=AZURE_OAI_API_VERSION,
+    azure_endpoint=AZURE_OAI_ENDPOINT,
 )
 
 # Хранилище STT-сессий по streamSid
 stt_sessions: dict[str, "AzureSTTSession"] = {}
 
+llm_sessions: dict[str, "LLMConversation"] = {}
+
+# ==== Azure OpenAI LLM ====
+class LLMConversation:
+    """
+    Одна LLM-сессия на один Twilio streamSid.
+    Хранит контекст и ходит в Azure OpenAI (streaming).
+    """
+
+    def __init__(self, stream_sid: str):
+        self.stream_sid = stream_sid
+        self.messages: list[dict] = []
+
+        # Базовый системный промпт: автосервис, RU/LV
+        system_prompt = (
+            "Ты голосовой ассистент автосервиса. "
+            "Определи язык пользователя (русский или латышский) по его первым словам "
+            "и отвечай строго на этом языке. "
+            "Говори короткими, простыми фразами, не больше двух предложений за раз. "
+            "Уточняй проблему с машиной и предлагай записаться на осмотр."
+        )
+        self.messages.append({"role": "system", "content": system_prompt})
+
+    def handle_user_utterance(self, text: str, lang_code: str | None = None) -> str:
+        """
+        Добавляем фразу пользователя в контекст, вызываем Azure OpenAI (stream=True),
+        стримим токены в лог, возвращаем финальный текст ответа.
+        """
+
+        # Дополнительная подсказка про язык
+        if lang_code:
+            self.messages.append({
+                "role": "system",
+                "content": f"Пользователь говорит на языке: {lang_code}. "
+                           f"Отвечай на этом же языке."
+            })
+
+        # Фраза пользователя
+        self.messages.append({"role": "user", "content": text})
+
+        logger.info(f"[{self.stream_sid}] LLM: sending user text: {text!r}")
+
+        reply_text = ""
+
+        try:
+            stream = oai_client.chat.completions.create(
+                model=AZURE_OAI_DEPLOYMENT,  # имя деплоя
+                messages=self.messages,
+                stream=True,
+                max_tokens=256,
+                temperature=0.4,
+            )
+
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if not delta:
+                    continue
+                reply_text += delta
+                # Пока просто логируем стримящийся текст
+                logger.info(f"[{self.stream_sid}] LLM partial: {delta!r}")
+
+            logger.info(f"[{self.stream_sid}] LLM final: {reply_text!r}")
+
+            # Сохраняем в контекст
+            self.messages.append({"role": "assistant", "content": reply_text})
+
+        except Exception as e:
+            logger.exception(f"[{self.stream_sid}] LLM error: {e}")
+            reply_text = ""
+
+        return reply_text
+
+# ==== Azure STT ====
 class AzureSTTSession:
     """
     Одна STT-сессия Azure на один Twilio streamSid.
@@ -43,11 +130,10 @@ class AzureSTTSession:
     и пишет в PushAudioInputStream.
     """
 
-    def __init__(self, stream_sid: str):
+    def __init__(self, stream_sid: str, on_final_callback=None):
         self.stream_sid = stream_sid
-
-        # Состояние для ресемплера (audioop.ratecv)
         self._rate_state = None
+        self.on_final_callback = on_final_callback
 
         # БЕЗ формата -> дефолт: 16kHz, 16bit, mono PCM
         self.push_stream = speechsdk.audio.PushAudioInputStream()
@@ -131,14 +217,23 @@ class AzureSTTSession:
         if result.reason == speechsdk.ResultReason.RecognizedSpeech:
             text = result.text
             props = result.properties
-            lang = props.get(
+            lang_raw = props.get(
                 speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult
             )
+
             logger.info(
-                f"[{self.stream_sid}] Recognized (final) "
-                f"[lang={lang}]: {text}"
+                f"[{self.stream_sid}] Recognized (final) [lang={lang_raw}]: {text!r}"
             )
-            # TODO: здесь позже будем вызывать LLM и TTS
+
+            # Вызовем колбэк (LLM)
+            if self.on_final_callback and text:
+                try:
+                    self.on_final_callback(self.stream_sid, text, lang_raw)
+                except Exception as e:
+                    logger.exception(
+                        f"[{self.stream_sid}] Error in on_final_callback: {e}"
+                    )
+
         elif result.reason == speechsdk.ResultReason.NoMatch:
             logger.info(f"[{self.stream_sid}] NoMatch: {result.no_match_details}")
 
@@ -148,9 +243,7 @@ class AzureSTTSession:
             f"error_details={evt.error_details}"
         )
 
-
 # ==== Twilio Media Stream: WebSocket с аудио ====
-
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
@@ -177,7 +270,10 @@ async def twilio_stream(ws: WebSocket):
                     logger.warning(
                         f"STT session for {stream_sid} already exists, overwriting"
                     )
-                stt_sessions[stream_sid] = AzureSTTSession(stream_sid)
+                stt_sessions[stream_sid] = AzureSTTSession(
+                    stream_sid,
+                    on_final_callback=handle_final_transcript,
+                )
 
             elif event == "media":
                 if not stream_sid:
@@ -213,9 +309,7 @@ async def twilio_stream(ws: WebSocket):
             del stt_sessions[stream_sid]
         logger.info("Twilio handler finished")
 
-
 # ==== Twilio webhook: TwiML, подключающий Media Stream ====
-
 @app.post("/voice")
 async def voice_webhook(request: Request):
     """
@@ -239,3 +333,40 @@ async def voice_webhook(request: Request):
     
     # Важно: отдать как XML
     return PlainTextResponse(content=twiml, media_type="application/xml")
+
+
+def handle_final_transcript(stream_sid: str, text: str, lang_raw: str | None):
+    """
+    Вызывается, когда Azure STT распознал финальный текст.
+    Создаёт/берёт LLMConversation и отправляет туда фразу.
+    Пока что только логируем ответ LLM.
+    """
+    # Попробуем вытащить код языка из JSON строки Azure
+    lang_code = None
+    if lang_raw:
+        try:
+            obj = json.loads(lang_raw)
+            # Azure иногда использует "language" или "Language"
+            lang_code = obj.get("language") or obj.get("Language")
+        except Exception:
+            lang_code = lang_raw  # ну хоть что-то
+
+    logger.info(
+        f"[{stream_sid}] Final transcript for LLM "
+        f"[lang_raw={lang_raw!r}, lang_code={lang_code!r}]: {text!r}"
+    )
+
+    # Берём/создаём LLM-сессию
+    if stream_sid not in llm_sessions:
+        llm_sessions[stream_sid] = LLMConversation(stream_sid)
+
+    conv = llm_sessions[stream_sid]
+
+    # ⚠️ Внимание: это синхронный вызов, но он идёт из потока Azure STT,
+    # не блокируя обработку Twilio WebSocket.
+    reply_text = conv.handle_user_utterance(text, lang_code=lang_code)
+
+    # На этом шаге мы пока НИЧЕГО не отправляем обратно в Twilio,
+    # только логируем. Позже сюда подвесим TTS.
+    if reply_text:
+        logger.info(f"[{stream_sid}] LLM reply ready (for future TTS): {reply_text!r}")
