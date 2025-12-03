@@ -2,7 +2,7 @@ import json
 import logging
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio")
@@ -62,5 +62,30 @@ async def twilio_stream(ws: WebSocket):
         logger.exception(f"Error in twilio_stream: {e}")
     finally:
         logger.info("Twilio handler finished")
+
+
+@app.post("/voice")
+async def voice_webhook(request: Request):
+    """
+    Twilio webhook: отдаём TwiML, который сразу подключает Media Stream.
+    Клиент говорит первым.
+    """
+    host = request.url.hostname
+    # Если у тебя всегда HTTPS, смело фиксируем wss
+    ws_url = f"wss://{host}/twilio-stream"
+
+    logger.info(f"/voice: building TwiML with ws_url={ws_url}")
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Connect>
+            <Stream url="{ws_url}">
+                <Parameter name="botSession" value="car-assistant" />
+            </Stream>
+        </Connect>
+    </Response>"""
+    
+    # Важно: отдать как XML
+    return PlainTextResponse(content=twiml, media_type="application/xml")
 
 
