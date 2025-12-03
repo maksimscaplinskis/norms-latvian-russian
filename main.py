@@ -4,182 +4,143 @@ import logging
 import time
 import asyncio
 
+import websockets
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
-
-from elevenlabs import (
-    ElevenLabs,
-    AudioFormat,
-    CommitStrategy,
-    RealtimeAudioOptions,
-    RealtimeEvents,
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio")
 
-# FastAPI INIT
 app = FastAPI()
 
-# ElevenLabs INIT Config
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-if not ELEVENLABS_API_KEY:
-    logger.warning("ELEVENLABS_API_KEY is not set – Scribe STT will fail")
-
-eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-# ElevenLabs SST Config
-SCRIBE_CONFIG = RealtimeAudioOptions(
-    model_id="scribe_v2_realtime",
-    language_code="auto",
-    audio_format="mulaw_8000",
-    sample_rate=8000,
-    commit_strategy=CommitStrategy.VAD,   # авто-коммиты по VAD
-    vad_silence_threshold_secs=1.2,      # можно будет подкрутить
-    vad_threshold=0.4,
-    min_speech_duration_ms=150,
-    min_silence_duration_ms=120,
-    include_timestamps=False,
+SCRIBE_WS_URL = (
+    "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+    "?model_id=scribe_v2_realtime"
+    "&audio_format=ulaw_8000"      # формат, который даёт Twilio
+    "&commit_strategy=vad"         # авто-коммит по паузам
+    "&include_timestamps=false"
 )
 
-# WebSocket
+async def scribe_receiver(ws):
+    """
+    Читаем события от ElevenLabs Scribe и логируем транскрипт.
+    """
+    try:
+        async for msg in ws:
+            data = json.loads(msg)
+            mtype = data.get("message_type")
+
+            if mtype == "session_started":
+                logger.info(
+                    f"Scribe session_started session_id={data.get('session_id')}"
+                )
+
+            elif mtype == "partial_transcript":
+                text = data.get("text", "")
+                if text:
+                    logger.info(f"Scribe partial: {text!r}")
+
+            elif mtype == "committed_transcript":
+                text = data.get("text", "")
+                if text:
+                    logger.info(f"Scribe committed: {text!r}")
+
+            else:
+                # На первых порах просто смотрим, что там ещё приходит
+                logger.info(f"Scribe event: {data}")
+
+    except Exception as e:
+        logger.exception(f"Scribe receiver error: {e}")
+
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
-    t0 = time.perf_counter()
     await ws.accept()
-    logger.info("WS accepted, dt=%.3f", time.perf_counter() - t0)
+    logger.info("Twilio WS connected")
 
     stream_sid = None
     media_frames = 0
 
-    # === NEW: соединение с Eleven Scribe для этого звонка ===
-    scribe_connection = None
-
-    # Эти переменные потом пригодятся, когда будем слать текст в Azure
-    last_partial = ""
-    last_committed = ""
-
-    # --- колбэки Scribe (вызваются из SDK, не async) ---
-
-    def on_partial(msg):
-        """
-        partial_transcript – живой текст по мере речи.
-        """
-        nonlocal last_partial
-        text = None
-        # msg может быть dict или объект, подстрахуемся
-        if isinstance(msg, dict):
-            text = msg.get("text")
-        else:
-            text = getattr(msg, "text", None)
-
-        if text:
-            last_partial = text
-            logger.info("SCRIBE partial: %s", text)
-
-    def on_committed(msg):
-        """
-        committed_transcript – законченный фрагмент (реплика пользователя).
-        """
-        nonlocal last_committed
-        text = None
-        if isinstance(msg, dict):
-            text = msg.get("text")
-        else:
-            text = getattr(msg, "text", None)
-
-        if text:
-            last_committed = text
-            logger.info("SCRIBE COMMITTED: %s", text)
-            # Тут позже будем дергать Azure/LLM
-
-    def on_scribe_error(err):
-        logger.error("SCRIBE ERROR: %s", err)
-
-    def on_scribe_close():
-        logger.info("SCRIBE connection closed")
+    scribe_ws = None
+    scribe_task = None
 
     try:
         while True:
-            # Twilio присылает текстовые JSON-сообщения
             msg = await ws.receive_text()
-            now = time.perf_counter()
-
             data = json.loads(msg)
             event = data.get("event")
-
-            logger.info("Received event=%s dt=%.3f", event, now - t0)
 
             if event == "connected":
                 logger.info("Twilio event=connected")
 
             elif event == "start":
                 stream_sid = data["start"]["streamSid"]
-                logger.info("Twilio stream START streamSid=%s", stream_sid)
+                logger.info(f"Twilio stream START streamSid={stream_sid}")
 
-                # === NEW: открываем соединение с Eleven Scribe ===
-                try:
-                    scribe_connection = await eleven.speech_to_text.realtime.connect(
-                        SCRIBE_CONFIG
+                # --- Подключаемся к ElevenLabs Scribe ---
+                if not ELEVEN_API_KEY:
+                    logger.error("ELEVENLABS_API_KEY is not set!")
+                else:
+                    logger.info("Connecting to ElevenLabs Scribe websocket...")
+                    scribe_ws = await websockets.connect(
+                        SCRIBE_WS_URL,
+                        extra_headers={
+                            "xi-api-key": ELEVEN_API_KEY,
+                        },
                     )
-                    logger.info("SCRIBE connected for streamSid=%s", stream_sid)
-
-                    # Регистрируем обработчики событий
-                    scribe_connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, on_partial)
-                    scribe_connection.on(
-                        RealtimeEvents.COMMITTED_TRANSCRIPT, on_committed
-                    )
-                    scribe_connection.on(RealtimeEvents.ERROR, on_scribe_error)
-                    scribe_connection.on(RealtimeEvents.CLOSE, on_scribe_close)
-
-                except Exception as e:
-                    logger.exception("Failed to connect to Scribe: %s", e)
-                    # Можно решить: рвём звонок или просто живем без STT
+                    # Запускаем приём транскриптов в фоне
+                    scribe_task = asyncio.create_task(scribe_receiver(scribe_ws))
 
             elif event == "media":
                 media_frames += 1
+                # диагноcтика по-прежнему
+                if media_frames % 50 == 0:
+                    logger.info(
+                        f"Received {media_frames} media frames for streamSid={stream_sid}"
+                    )
 
-                # === NEW: отправляем аудио в Scribe ===
-                if scribe_connection is not None:
+                # Отправляем аудио в ElevenLabs, если подключены
+                if scribe_ws is not None:
+                    payload_b64 = data["media"]["payload"]  # база64 от Twilio (ulaw 8k)
+
+                    msg_to_scribe = {
+                        "message_type": "input_audio_chunk",
+                        "audio_base_64": payload_b64,
+                        "sample_rate": 8000,   # Twilio Media Streams = 8kHz
+                        # "commit": False      # с VAD можно commit не ставить
+                    }
+
                     try:
-                        payload_b64 = data["media"]["payload"]  # μ-law 8kHz, base64
-                        # Важно: передать sample_rate=8000
-                        await scribe_connection.send(
-                            {
-                                "audio_base_64": payload_b64,
-                                "sample_rate": 8000,
-                            }
-                        )
+                        await scribe_ws.send(json.dumps(msg_to_scribe))
                     except Exception as e:
-                        logger.exception("Error sending audio to Scribe: %s", e)
-
-            elif event == "mark":
-                mark_name = data["mark"]["name"]
-                logger.info("Twilio mark name=%s", mark_name)
+                        logger.exception(f"Error sending audio to Scribe: {e}")
 
             elif event == "stop":
-                logger.info("Twilio stream STOP streamSid=%s", stream_sid)
-
-                # === NEW: закрываем Scribe соединение ===
-                if scribe_connection is not None:
-                    try:
-                        await scribe_connection.close()
-                    except Exception as e:
-                        logger.exception("Error closing Scribe connection: %s", e)
-
+                logger.info(f"Twilio stream STOP streamSid={stream_sid}")
                 break
 
             else:
-                logger.info("Unknown Twilio event: %s", event)
+                logger.info(f"Unknown Twilio event: {event}")
 
     except WebSocketDisconnect:
         logger.info("Twilio WS disconnected")
-    except Exception as e:
-        logger.exception("Error in twilio_stream: %s", e)
-    finally:
-        logger.info("Twilio handler finished")
 
+    except Exception as e:
+        logger.exception(f"Error in twilio_stream: {e}")
+
+    finally:
+        # Чисто закрываем Scribe
+        if scribe_task is not None:
+            scribe_task.cancel()
+        if scribe_ws is not None:
+            try:
+                await scribe_ws.close()
+            except Exception:
+                pass
+
+        logger.info("Twilio handler finished")
 
 @app.post("/voice")
 async def voice_webhook(request: Request):
