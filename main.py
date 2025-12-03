@@ -6,7 +6,7 @@ import audioop
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
-from openai import AzureOpenAI
+from openai import OpenAI
 
 import azure.cognitiveservices.speech as speechsdk
 
@@ -32,38 +32,31 @@ auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
     languages=["lv-LV", "ru-RU"]
 )
 
-# ====  Azure OpenAI общая конфигурация  ====
-AZURE_OAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
-AZURE_OAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")  # пример
+# ====  OpenAI общая конфигурация  ====
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1-mini")
 
-if not AZURE_OAI_API_KEY or not AZURE_OAI_ENDPOINT:
-    logger.warning("Azure OpenAI credentials are not set!")
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set!")
 
-oai_client = AzureOpenAI(
-    api_key=AZURE_OAI_API_KEY,
-    api_version=AZURE_OAI_API_VERSION,
-    azure_endpoint=AZURE_OAI_ENDPOINT,
-)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Хранилище STT-сессий по streamSid
 stt_sessions: dict[str, "AzureSTTSession"] = {}
 
 llm_sessions: dict[str, "LLMConversation"] = {}
 
-# ==== Azure OpenAI LLM ====
+# ====  OpenAI LLM  ====
 class LLMConversation:
     """
     Одна LLM-сессия на один Twilio streamSid.
-    Хранит контекст и ходит в Azure OpenAI (streaming).
+    Хранит контекст и ходит в OpenAI (streaming).
     """
 
     def __init__(self, stream_sid: str):
         self.stream_sid = stream_sid
         self.messages: list[dict] = []
 
-        # Базовый системный промпт: автосервис, RU/LV
         system_prompt = (
             "Ты голосовой ассистент автосервиса. "
             "Определи язык пользователя (русский или латышский) по его первым словам "
@@ -75,11 +68,10 @@ class LLMConversation:
 
     def handle_user_utterance(self, text: str, lang_code: str | None = None) -> str:
         """
-        Добавляем фразу пользователя в контекст, вызываем Azure OpenAI (stream=True),
+        Добавляем фразу пользователя в контекст, вызываем OpenAI (stream=True),
         стримим токены в лог, возвращаем финальный текст ответа.
         """
 
-        # Дополнительная подсказка про язык
         if lang_code:
             self.messages.append({
                 "role": "system",
@@ -87,16 +79,14 @@ class LLMConversation:
                            f"Отвечай на этом же языке."
             })
 
-        # Фраза пользователя
         self.messages.append({"role": "user", "content": text})
-
-        logger.info(f"[{self.stream_sid}] LLM: sending user text: {text!r}")
+        logger.info(f"[{self.stream_sid}] LLM(OpenAI): sending user text: {text!r}")
 
         reply_text = ""
 
         try:
-            stream = oai_client.chat.completions.create(
-                model=AZURE_OAI_DEPLOYMENT,  # имя деплоя
+            stream = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
                 messages=self.messages,
                 stream=True,
                 max_tokens=256,
@@ -108,12 +98,9 @@ class LLMConversation:
                 if not delta:
                     continue
                 reply_text += delta
-                # Пока просто логируем стримящийся текст
                 logger.info(f"[{self.stream_sid}] LLM partial: {delta!r}")
 
             logger.info(f"[{self.stream_sid}] LLM final: {reply_text!r}")
-
-            # Сохраняем в контекст
             self.messages.append({"role": "assistant", "content": reply_text})
 
         except Exception as e:
@@ -122,7 +109,7 @@ class LLMConversation:
 
         return reply_text
 
-# ==== Azure STT ====
+# ====  Azure STT  ====
 class AzureSTTSession:
     """
     Одна STT-сессия Azure на один Twilio streamSid.
@@ -243,7 +230,7 @@ class AzureSTTSession:
             f"error_details={evt.error_details}"
         )
 
-# ==== Twilio Media Stream: WebSocket с аудио ====
+# ====  Twilio Media Stream: WebSocket с аудио  ====
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
@@ -309,7 +296,7 @@ async def twilio_stream(ws: WebSocket):
             del stt_sessions[stream_sid]
         logger.info("Twilio handler finished")
 
-# ==== Twilio webhook: TwiML, подключающий Media Stream ====
+# ====  Twilio webhook: TwiML, подключающий Media Stream  ====
 @app.post("/voice")
 async def voice_webhook(request: Request):
     """
