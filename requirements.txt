@@ -2,4 +2,6 @@ fastapi
 uvicorn[standard]
 azure-cognitiveservices-speech
 openai
+elevenlabs
+websockets
 httpx

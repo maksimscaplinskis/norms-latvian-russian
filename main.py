@@ -1,101 +1,142 @@
 import os
 import json
+import base64
 import logging
 import time
-import asyncio
-import httpx
-
-import websockets
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
+
+import azure.cognitiveservices.speech as speechsdk
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio")
 
 app = FastAPI()
 
-ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+# ====  Azure Speech общая конфигурация  ====
 
-SCRIBE_BASE_URL = (
-    "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
-    "?model_id=scribe_v2_realtime"
-    "&audio_format=ulaw_8000"
-    "&commit_strategy=vad"
-    "&include_timestamps=false"
+SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+
+if not SPEECH_KEY or not SPEECH_REGION:
+    logger.warning("AZURE_SPEECH_KEY or AZURE_SPEECH_REGION is not set!")
+
+speech_config = speechsdk.SpeechConfig(
+    subscription=SPEECH_KEY,
+    region=SPEECH_REGION,
 )
 
-TOKEN_URL = "https://api.elevenlabs.io/v1/speech-to-text/get-realtime-token"
+# Авто-определение RU / LV
+auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
+    languages=["ru-RU", "lv-LV"]
+)
 
-async def get_scribe_token() -> str | None:
-    if not ELEVEN_API_KEY:
-        logger.error("ELEVENLABS_API_KEY is not set!")
-        return None
+# Формат аудио: 8kHz, 8bit, mono, MULAW (как у Twilio)
+mulaw_stream_format = speechsdk.audio.AudioStreamFormat(
+    samples_per_second=8000,
+    bits_per_sample=8,
+    channels=1,
+    compressed_stream_format=speechsdk.AudioStreamContainerFormat.MULAW,
+)
 
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                TOKEN_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "xi-api-key": ELEVEN_API_KEY,
-                },
-                json={
-                    "model_id": "scribe_v2_realtime",
-                    "ttl_secs": 300,
-                },
-            )
-        if resp.status_code != 200:
-            logger.error(
-                "Failed to get scribe token: %s %s",
-                resp.status_code,
-                resp.text[:200],
-            )
-            return None
+# Хранилище STT-сессий по streamSid
+stt_sessions: dict[str, "AzureSTTSession"] = {}
 
-        data = resp.json()
-        token = data.get("token")
-        if not token:
-            logger.error("No 'token' field in scribe token response: %s", data)
-            return None
-
-        logger.info("Got scribe token")
-        return token
-
-    except Exception as e:
-        logger.exception(f"Error getting scribe token: {e}")
-        return None
-
-async def scribe_receiver(ws):
+class AzureSTTSession:
     """
-    Читаем события от ElevenLabs Scribe и логируем транскрипт.
+    Одна STT-сессия Azure на один Twilio streamSid.
+    Принимает μ-law 8kHz байты, пишет их в PushAudioInputStream,
+    а SpeechRecognizer выстреливает recognizing/recognized события.
     """
-    try:
-        async for msg in ws:
-            data = json.loads(msg)
-            mtype = data.get("message_type")
 
-            if mtype == "session_started":
-                logger.info(
-                    f"Scribe session_started session_id={data.get('session_id')}"
-                )
+    def __init__(self, stream_sid: str):
+        self.stream_sid = stream_sid
 
-            elif mtype == "partial_transcript":
-                text = data.get("text", "")
-                if text:
-                    logger.info(f"Scribe partial: {text!r}")
+        self.push_stream = speechsdk.audio.PushAudioInputStream(
+            stream_format=mulaw_stream_format
+        )
+        audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
 
-            elif mtype == "committed_transcript":
-                text = data.get("text", "")
-                if text:
-                    logger.info(f"Scribe committed: {text!r}")
+        self.recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config,
+            audio_config=audio_config,
+            auto_detect_source_language_config=auto_detect_config,
+        )
 
-            else:
-                # На первых порах просто смотрим, что там ещё приходит
-                logger.info(f"Scribe event: {data}")
+        # Подписываемся на события
+        self.recognizer.recognizing.connect(self._on_recognizing)
+        self.recognizer.recognized.connect(self._on_recognized)
+        self.recognizer.canceled.connect(self._on_canceled)
+        self.recognizer.session_started.connect(
+            lambda evt: logger.info(f"[{self.stream_sid}] Azure STT session started")
+        )
+        self.recognizer.session_stopped.connect(
+            lambda evt: logger.info(f"[{self.stream_sid}] Azure STT session stopped")
+        )
 
-    except Exception as e:
-        logger.exception(f"Scribe receiver error: {e}")
+        logger.info(f"[{self.stream_sid}] Creating Azure STT session")
+
+        # Запускаем continuous recognition (внутри SDK отдельный поток)
+        self.recognizer.start_continuous_recognition()
+
+    def push_audio(self, mulaw_bytes: bytes):
+        """Прокидываем аудио-чанк от Twilio в Azure."""
+        self.push_stream.write(mulaw_bytes)
+
+    def stop(self):
+        """Корректно закрываем стрим и останавливаем распознавание."""
+        try:
+            logger.info(f"[{self.stream_sid}] Stopping Azure STT session")
+            self.push_stream.close()
+            self.recognizer.stop_continuous_recognition()
+        except Exception as e:
+            logger.exception(f"[{self.stream_sid}] Error while stopping STT: {e}")
+
+    # ----- callbacks -----
+
+    def _on_recognizing(self, evt: speechsdk.SpeechRecognitionEventArgs):
+        result = evt.result
+        text = result.text
+        if not text:
+            return
+
+        lang = None
+        # пробуем достать определённый язык
+        props = result.properties
+        lang = props.get(
+            speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult
+        )
+
+        logger.info(
+            f"[{self.stream_sid}] Recognizing (partial) "
+            f"[lang={lang}]: {text}"
+        )
+
+    def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs):
+        result = evt.result
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            text = result.text
+            props = result.properties
+            lang = props.get(
+                speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult
+            )
+            logger.info(
+                f"[{self.stream_sid}] Recognized (final) "
+                f"[lang={lang}]: {text}"
+            )
+            # TODO: здесь позже будем вызывать LLM и TTS
+        elif result.reason == speechsdk.ResultReason.NoMatch:
+            logger.info(f"[{self.stream_sid}] NoMatch: {result.no_match_details}")
+
+    def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs):
+        logger.warning(
+            f"[{self.stream_sid}] CANCELED: reason={evt.reason}, "
+            f"error_details={evt.error_details}"
+        )
+
+
+# ==== Twilio Media Stream: WebSocket с аудио ====
 
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
@@ -103,10 +144,6 @@ async def twilio_stream(ws: WebSocket):
     logger.info("Twilio WS connected")
 
     stream_sid = None
-    media_frames = 0
-
-    scribe_ws = None
-    scribe_task = None
 
     try:
         while True:
@@ -118,50 +155,35 @@ async def twilio_stream(ws: WebSocket):
                 logger.info("Twilio event=connected")
 
             elif event == "start":
-                stream_sid = data["start"]["streamSid"]
+                start_info = data["start"]
+                stream_sid = start_info["streamSid"]
                 logger.info(f"Twilio stream START streamSid={stream_sid}")
 
-                # --- Подключаемся к ElevenLabs Scribe через token ---
-                token = await get_scribe_token()
-                if not token:
-                    logger.error("Cannot start Scribe: no token")
-                else:
-                    scribe_url = f"{SCRIBE_BASE_URL}&token={token}"
-                    logger.info(f"Connecting to ElevenLabs Scribe websocket: {scribe_url}")
-                    try:
-                        scribe_ws = await websockets.connect(scribe_url)
-                        scribe_task = asyncio.create_task(scribe_receiver(scribe_ws))
-                    except Exception as e:
-                        logger.exception(f"Error connecting to Scribe websocket: {e}")
-                        scribe_ws = None
-                        scribe_task = None
+                # создаём STT сессию под этот streamSid
+                if stream_sid in stt_sessions:
+                    logger.warning(
+                        f"STT session for {stream_sid} already exists, overwriting"
+                    )
+                stt_sessions[stream_sid] = AzureSTTSession(stream_sid)
 
             elif event == "media":
-                media_frames += 1
-                # диагноcтика по-прежнему
-                if media_frames % 50 == 0:
-                    logger.info(
-                        f"Received {media_frames} media frames for streamSid={stream_sid}"
-                    )
+                if not stream_sid:
+                    # на всякий случай
+                    logger.warning("Got media before start; skipping")
+                    continue
 
-                # Отправляем аудио в ElevenLabs, если подключены
-                if scribe_ws is not None:
-                    payload_b64 = data["media"]["payload"]  # база64 от Twilio (ulaw 8k)
+                payload_b64 = data["media"]["payload"]
+                mulaw_bytes = base64.b64decode(payload_b64)
 
-                    msg_to_scribe = {
-                        "message_type": "input_audio_chunk",
-                        "audio_base_64": payload_b64,
-                        "sample_rate": 8000,   # Twilio Media Streams = 8kHz
-                        # "commit": False      # с VAD можно commit не ставить
-                    }
-
-                    try:
-                        await scribe_ws.send(json.dumps(msg_to_scribe))
-                    except Exception as e:
-                        logger.exception(f"Error sending audio to Scribe: {e}")
+                session = stt_sessions.get(stream_sid)
+                if session:
+                    session.push_audio(mulaw_bytes)
 
             elif event == "stop":
                 logger.info(f"Twilio stream STOP streamSid={stream_sid}")
+                if stream_sid and stream_sid in stt_sessions:
+                    stt_sessions[stream_sid].stop()
+                    del stt_sessions[stream_sid]
                 break
 
             else:
@@ -169,21 +191,17 @@ async def twilio_stream(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Twilio WS disconnected")
-
     except Exception as e:
         logger.exception(f"Error in twilio_stream: {e}")
-
     finally:
-        # Чисто закрываем Scribe
-        if scribe_task is not None:
-            scribe_task.cancel()
-        if scribe_ws is not None:
-            try:
-                await scribe_ws.close()
-            except Exception:
-                pass
-
+        # на всякий случай чистим сессию, если осталась
+        if stream_sid and stream_sid in stt_sessions:
+            stt_sessions[stream_sid].stop()
+            del stt_sessions[stream_sid]
         logger.info("Twilio handler finished")
+
+
+# ==== Twilio webhook: TwiML, подключающий Media Stream ====
 
 @app.post("/voice")
 async def voice_webhook(request: Request):
@@ -208,5 +226,3 @@ async def voice_webhook(request: Request):
     
     # Важно: отдать как XML
     return PlainTextResponse(content=twiml, media_type="application/xml")
-
-
