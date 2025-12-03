@@ -3,6 +3,7 @@ import json
 import base64
 import logging
 import time
+import audioop
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -32,30 +33,24 @@ auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
     languages=["ru-RU", "lv-LV"]
 )
 
-# Формат аудио: 8kHz, 8bit, mono, MULAW (как у Twilio)
-mulaw_stream_format = speechsdk.audio.AudioStreamFormat(
-    samples_per_second=8000,
-    bits_per_sample=8,
-    channels=1,
-    compressed_stream_format=speechsdk.AudioStreamContainerFormat.MULAW,
-)
-
 # Хранилище STT-сессий по streamSid
 stt_sessions: dict[str, "AzureSTTSession"] = {}
 
 class AzureSTTSession:
     """
     Одна STT-сессия Azure на один Twilio streamSid.
-    Принимает μ-law 8kHz байты, пишет их в PushAudioInputStream,
-    а SpeechRecognizer выстреливает recognizing/recognized события.
+    Принимает μ-law 8kHz байты, конвертирует их в 16kHz 16-bit PCM
+    и пишет в PushAudioInputStream.
     """
 
     def __init__(self, stream_sid: str):
         self.stream_sid = stream_sid
 
-        self.push_stream = speechsdk.audio.PushAudioInputStream(
-            stream_format=mulaw_stream_format
-        )
+        # Состояние для ресемплера (audioop.ratecv)
+        self._rate_state = None
+
+        # БЕЗ формата -> дефолт: 16kHz, 16bit, mono PCM
+        self.push_stream = speechsdk.audio.PushAudioInputStream()
         audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
 
         self.recognizer = speechsdk.SpeechRecognizer(
@@ -64,7 +59,7 @@ class AzureSTTSession:
             auto_detect_source_language_config=auto_detect_config,
         )
 
-        # Подписываемся на события
+        # События
         self.recognizer.recognizing.connect(self._on_recognizing)
         self.recognizer.recognized.connect(self._on_recognized)
         self.recognizer.canceled.connect(self._on_canceled)
@@ -77,15 +72,33 @@ class AzureSTTSession:
 
         logger.info(f"[{self.stream_sid}] Creating Azure STT session")
 
-        # Запускаем continuous recognition (внутри SDK отдельный поток)
         self.recognizer.start_continuous_recognition()
 
     def push_audio(self, mulaw_bytes: bytes):
-        """Прокидываем аудио-чанк от Twilio в Azure."""
-        self.push_stream.write(mulaw_bytes)
+        """
+        Получает μ-law 8kHz байты от Twilio,
+        конвертирует в 16-bit PCM 16kHz и отправляет в Azure.
+        """
+        if not mulaw_bytes:
+            return
+
+        # 1) μ-law (8bit) -> PCM 16bit, 8kHz
+        pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)  # 2 байта на сэмпл
+
+        # 2) 8kHz -> 16kHz (ratecv поддерживает состояние между вызовами)
+        pcm16_16k, self._rate_state = audioop.ratecv(
+            pcm16_8k,
+            2,      # ширина сэмпла (байты)
+            1,      # каналов
+            8000,   # in_rate
+            16000,  # out_rate
+            self._rate_state,
+        )
+
+        # 3) Пишем в поток Azure
+        self.push_stream.write(pcm16_16k)
 
     def stop(self):
-        """Корректно закрываем стрим и останавливаем распознавание."""
         try:
             logger.info(f"[{self.stream_sid}] Stopping Azure STT session")
             self.push_stream.close()
