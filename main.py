@@ -16,11 +16,11 @@ app = FastAPI()
 
 # ====  Azure Speech общая конфигурация  ====
 
-SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
-SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+SPEECH_KEY = os.getenv("SPEECH_KEY")
+SPEECH_REGION = os.getenv("SPEECH_REGION")
 
 if not SPEECH_KEY or not SPEECH_REGION:
-    logger.warning("AZURE_SPEECH_KEY or AZURE_SPEECH_REGION is not set!")
+    logger.warning("SPEECH_KEY or SPEECH_REGION is not set!")
 
 speech_config = speechsdk.SpeechConfig(
     subscription=SPEECH_KEY,
