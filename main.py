@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 import azure.cognitiveservices.speech as speechsdk
 from azure.cognitiveservices.speech.languageconfig import AutoDetectSourceLanguageConfig
 from openai import OpenAI
-
+from openai import AsyncOpenAI
 
 # ---------- Логгер ----------
 
@@ -69,7 +69,7 @@ AUTO_DETECT_CONFIG = AutoDetectSourceLanguageConfig(
 # Уменьшаем время "тишины в конце фразы", после которой STT отдаёт финальный текст
 stt_speech_config.set_property(
     speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-    "300"  # 300 мс вместо дефолтных ~700–1500
+    "500"  # 300 мс вместо дефолтных ~700–1500
 )
 
 # На всякий случай ограничим длинную начальную тишину
@@ -79,7 +79,7 @@ stt_speech_config.set_property(
 )
 
 # OpenAI (Foundry / Azure OpenAI v1)
-openai_client = OpenAI(
+openai_client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
 )
@@ -95,6 +95,24 @@ SESSIONS: Dict[str, List[dict]] = {}
 
 
 # ---------- Вспомогательные функции ----------
+
+async def gpt_turn_async(session_id: str, text: str, lang: Optional[str]):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        run_dialog_turn,
+        session_id,
+        text,
+        lang,
+    )
+
+async def tts_twilio_async(answer: str) -> bytes:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        synthesize_mulaw_bytes_for_twilio,
+        answer,
+    )
 
 def synthesize_to_bytes(text: str) -> bytes:
     """TTS в обычный wav (для HTTP-эндпоинтов)."""
@@ -131,30 +149,26 @@ def synthesize_mulaw_bytes_for_twilio(text: str) -> bytes:
         raise RuntimeError(msg)
 
 
-def run_dialog_turn(session_id: str, user_text: str, lang: Optional[str] = None) -> Tuple[str, str]:
-    """
-    Одна реплика диалога: добавляем user_text в историю, вызываем GPT,
-    сохраняем ответ. Возвращает (answer, session_id).
-    """
-    history = SESSIONS.get(session_id)
-    if not history:
-        history = [{"role": "system", "content": SYSTEM_PROMPT}]
+async def run_dialog_turn_async(session_id, user_text, lang=None):
 
+    MAX_HISTORY_MESSAGES = 10
+
+    history = SESSIONS.get(session_id) or [{"role": "system", "content": SYSTEM_PROMPT}]
     history.append({"role": "user", "content": user_text})
 
-    resp = openai_client.chat.completions.create(
+    resp = await openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=history,
         temperature=0.3,
-        max_tokens=64,  # короткие ответы
+        max_tokens=64,
     )
     answer = resp.choices[0].message.content
-
     history.append({"role": "assistant", "content": answer})
+    if len(history) > MAX_HISTORY_MESSAGES:
+        # сохранить system + последние 9
+        history = [history[0]] + history[-MAX_HISTORY_MESSAGES:]
     SESSIONS[session_id] = history
-
     return answer, session_id
-
 
 # ---------- HTTP-эндпоинты для теста ----------
 
@@ -304,7 +318,7 @@ async def conversation_loop(
             try:
                 if not session_id:
                     session_id = str(uuid.uuid4())
-                answer, session_id = run_dialog_turn(session_id, text, lang)
+                answer, session_id = await gpt_turn_async(session_id, text, lang)
                 logger.info(f"GPT answer: {answer!r}")
             except Exception as e:
                 logger.error(f"GPT error: {e}", exc_info=True)
@@ -321,7 +335,7 @@ async def conversation_loop(
 
             # TTS → μ-law
             try:
-                audio_bytes = synthesize_mulaw_bytes_for_twilio(answer)
+                audio_bytes = await tts_twilio_async(answer)
             except Exception as e:
                 logger.error(f"TTS for Twilio error: {e}", exc_info=True)
                 continue
@@ -375,7 +389,7 @@ async def twilio_stream(ws: WebSocket):
     stream_sid: Optional[str] = None
 
     # Очередь фраз, признанных Azure STT (text, lang)
-    recognized_queue: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue()
+    recognized_queue: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue(maxsize=3)
 
     # Стейт для детектора "клиент говорит"
     shared_state = {
@@ -419,25 +433,6 @@ async def twilio_stream(ws: WebSocket):
                 call_sid = start_info.get("callSid")
                 stream_sid = start_info.get("streamSid")
                 logger.info(f"Twilio stream START callSid={call_sid}, streamSid={stream_sid}")
-
-                initial_phrase = "Слушаю вас."  # или пустой бип, если сделаем заранее файл
-                try:
-                    audio_bytes = synthesize_mulaw_bytes_for_twilio(initial_phrase)
-                    frame_size = 160
-                    for i in range(0, len(audio_bytes), frame_size):
-                        frame = audio_bytes[i:i + frame_size]
-                        if not frame:
-                            continue
-                        payload = base64.b64encode(frame).decode("ascii")
-                        reply = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": payload},
-                        }
-                        await ws.send_text(json.dumps(reply))
-                        await asyncio.sleep(0.02)
-                except Exception as e:
-                    logger.error(f"Initial TTS error: {e}", exc_info=True)
 
                 # Инициализируем STT continuous
                 audio_format = speechsdk.audio.AudioStreamFormat(
