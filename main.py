@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import asyncio
+import httpx
 
 import websockets
 
@@ -16,13 +17,54 @@ app = FastAPI()
 
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-SCRIBE_WS_URL = (
+SCRIBE_BASE_URL = (
     "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
     "?model_id=scribe_v2_realtime"
-    "&audio_format=ulaw_8000"      # формат, который даёт Twilio
-    "&commit_strategy=vad"         # авто-коммит по паузам
+    "&audio_format=ulaw_8000"
+    "&commit_strategy=vad"
     "&include_timestamps=false"
 )
+
+TOKEN_URL = "https://api.elevenlabs.io/v1/speech-to-text/get-realtime-token"
+
+async def get_scribe_token() -> str | None:
+    if not ELEVEN_API_KEY:
+        logger.error("ELEVENLABS_API_KEY is not set!")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                TOKEN_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "xi-api-key": ELEVEN_API_KEY,
+                },
+                json={
+                    "model_id": "scribe_v2_realtime",
+                    "ttl_secs": 300,
+                },
+            )
+        if resp.status_code != 200:
+            logger.error(
+                "Failed to get scribe token: %s %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+            return None
+
+        data = resp.json()
+        token = data.get("token")
+        if not token:
+            logger.error("No 'token' field in scribe token response: %s", data)
+            return None
+
+        logger.info("Got scribe token")
+        return token
+
+    except Exception as e:
+        logger.exception(f"Error getting scribe token: {e}")
+        return None
 
 async def scribe_receiver(ws):
     """
@@ -79,19 +121,20 @@ async def twilio_stream(ws: WebSocket):
                 stream_sid = data["start"]["streamSid"]
                 logger.info(f"Twilio stream START streamSid={stream_sid}")
 
-                # --- Подключаемся к ElevenLabs Scribe ---
-                if not ELEVEN_API_KEY:
-                    logger.error("ELEVENLABS_API_KEY is not set!")
+                # --- Подключаемся к ElevenLabs Scribe через token ---
+                token = await get_scribe_token()
+                if not token:
+                    logger.error("Cannot start Scribe: no token")
                 else:
-                    logger.info("Connecting to ElevenLabs Scribe websocket...")
-                    scribe_ws = await websockets.connect(
-                        SCRIBE_WS_URL,
-                        extra_headers={
-                            "xi-api-key": ELEVEN_API_KEY,
-                        },
-                    )
-                    # Запускаем приём транскриптов в фоне
-                    scribe_task = asyncio.create_task(scribe_receiver(scribe_ws))
+                    scribe_url = f"{SCRIBE_BASE_URL}&token={token}"
+                    logger.info(f"Connecting to ElevenLabs Scribe websocket: {scribe_url}")
+                    try:
+                        scribe_ws = await websockets.connect(scribe_url)
+                        scribe_task = asyncio.create_task(scribe_receiver(scribe_ws))
+                    except Exception as e:
+                        logger.exception(f"Error connecting to Scribe websocket: {e}")
+                        scribe_ws = None
+                        scribe_task = None
 
             elif event == "media":
                 media_frames += 1
