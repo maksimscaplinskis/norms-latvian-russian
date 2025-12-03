@@ -100,7 +100,7 @@ async def gpt_turn_async(session_id: str, text: str, lang: Optional[str]):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        run_dialog_turn,
+        run_dialog_turn_async,
         session_id,
         text,
         lang,
@@ -244,7 +244,7 @@ async def dialog(payload: dict):
     session_id = payload.get("session_id") or str(uuid.uuid4())
 
     try:
-        answer, session_id = run_dialog_turn(session_id, user_text, None)
+        answer, session_id = run_dialog_turn_async(session_id, user_text, None)
         audio_bytes = synthesize_to_bytes(answer)
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
