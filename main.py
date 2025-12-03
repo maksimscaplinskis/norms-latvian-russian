@@ -32,8 +32,8 @@ eleven = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 # ElevenLabs SST Config
 SCRIBE_CONFIG = RealtimeAudioOptions(
     model_id="scribe_v2_realtime",
-    # language_code не указываем → автоопределение (RU/LV/EN и т.д.)
-    audio_format=AudioFormat.ULAW_8000,
+    language_code="auto"
+    audio_format="ulaw_8000",
     commit_strategy=CommitStrategy.VAD,   # авто-коммиты по VAD
     vad_silence_threshold_secs=1.2,      # можно будет подкрутить
     vad_threshold=0.4,
