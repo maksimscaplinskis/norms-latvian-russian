@@ -89,9 +89,9 @@ class LLMConversation:
                 model=OPENAI_MODEL,
                 messages=self.messages,
                 stream=True,
-                max_tokens=96,
+                max_completion_tokens=96,
                 temperature=0.4,
-                reasoning_effort="low"
+                reasoning_effort="none"
             )
 
             for chunk in stream:
