@@ -91,9 +91,7 @@ class LLMConversation:
                 stream=True,
                 max_tokens=96,
                 temperature=0.4,
-                reasoning={
-                    "effort": "low"
-                }
+                reasoning_effort="low"
             )
 
             for chunk in stream:
