@@ -34,7 +34,7 @@ auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
 
 # ====  OpenAI общая конфигурация  ====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY is not set!")
@@ -91,6 +91,9 @@ class LLMConversation:
                 stream=True,
                 max_tokens=96,
                 temperature=0.4,
+                reasoning={
+                    "effort": "low"
+                }
             )
 
             for chunk in stream:
