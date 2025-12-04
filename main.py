@@ -82,11 +82,10 @@ class LLMConversation:
         self.messages: list[dict] = []
 
         system_prompt = (
-            "Ты голосовой ассистент автосервиса. "
+            "Ты голосовой ассистент. "
             "Определи язык пользователя (русский или латышский) по его первым словам "
             "и отвечай строго на этом языке. "
             "Говори короткими, простыми фразами, не больше двух предложений за раз. "
-            "Уточняй проблему с машиной и предлагай записаться на осмотр."
         )
         self.messages.append({"role": "system", "content": system_prompt})
 
@@ -113,7 +112,7 @@ class LLMConversation:
                 model=OPENAI_MODEL,
                 messages=self.messages,
                 stream=True,
-                max_completion_tokens=96,
+                max_completion_tokens=64,
                 temperature=0.4,
                 reasoning_effort="none"
             )
@@ -441,26 +440,53 @@ def stream_tts_to_twilio(stream_sid: str, text: str):
         )
 
         for chunk in audio_stream:
+            # если чанк пустой или это не байты — пропускаем
             if not chunk or not isinstance(chunk, (bytes, bytearray)):
                 continue
 
+            # если Twilio уже отписался (stop/close) — выходим из цикла
+            if stream_sid not in twilio_connections:
+                logger.info(f"[{stream_sid}] Twilio connection gone, stop TTS streaming")
+                break
+
             payload_b64 = base64.b64encode(chunk).decode("ascii")
 
-            def _send():
-                # Эта функция уже выполняется в event loop’е
-                if ws.application_state.name != "CONNECTED":
-                    logger.warning(f"[{stream_sid}] WebSocket not connected, stop TTS send")
+            def _schedule_send(payload=payload_b64):
+                """
+                Этот код выполняется уже внутри event loop.
+                Здесь ещё раз проверяем, что соединение живое,
+                и отлавливаем ошибки отправки.
+                """
+                conn_inner = twilio_connections.get(stream_sid)
+                if not conn_inner:
+                    # стрим уже закрыт / удалён
                     return
-                msg = {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload_b64},
-                }
-                # создаём таск на отправку
-                asyncio.create_task(ws.send_text(json.dumps(msg)))
 
-            # Планируем отправку чанка в event loop из нашего потока
-            loop.call_soon_threadsafe(_send)
+                ws_inner, _ = conn_inner
+
+                async def _send_chunk():
+                    if ws_inner.application_state.name != "CONNECTED":
+                        # WebSocket уже закрыт — ничего не делаем
+                        return
+
+                    msg = {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": payload},
+                    }
+
+                    try:
+                        await ws_inner.send_text(json.dumps(msg))
+                    except RuntimeError as e:
+                        # Классический случай: "Unexpected ASGI message 'websocket.send'..."
+                        logger.warning(f"[{stream_sid}] TTS chunk send failed (WS closed): {e}")
+                    except Exception:
+                        logger.exception(f"[{stream_sid}] Unexpected error while sending TTS chunk")
+
+                asyncio.create_task(_send_chunk())
+
+            # планируем отправку чанка в event loop из текущего потока
+            loop.call_soon_threadsafe(_schedule_send)
 
     except Exception as e:
-        logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")        
+        logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")
