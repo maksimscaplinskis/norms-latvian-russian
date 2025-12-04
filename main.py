@@ -5,6 +5,11 @@ import logging
 import time
 import asyncio
 import httpx
+import audioop
+import websockets
+from urllib.parse import urlencode
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
+
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -130,143 +135,187 @@ class LLMConversation:
 # ====  ElevenLabs Scribe v2 Realtime STT  ====
 class ScribeRealtimeSession:
     """
-    Одна STT-сессия ElevenLabs Scribe v2 Realtime на один Twilio streamSid.
-    Принимает μ-law 8kHz байты от Twilio и отправляет их в Scribe по WebSocket.
+    STT-сессия ElevenLabs Scribe v2 Realtime для одного Twilio streamSid.
+    Берём μ-law 8kHz от Twilio, конвертим в PCM 16kHz и шлём в WebSocket.
     """
 
     def __init__(self, stream_sid: str, on_final_callback=None):
         self.stream_sid = stream_sid
         self.on_final_callback = on_final_callback
-        self.connection = None
+
+        self._rate_state = None
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._send_task: asyncio.Task | None = None
+        self._recv_task: asyncio.Task | None = None
         self._closed = False
 
     async def start(self):
         """
-        Открываем WebSocket-подключение к Scribe Realtime.
-        Используем ulaw_8000 + VAD, чтобы не думать про commit().
+        Открываем WebSocket к Scribe v2 Realtime и запускаем send/recv циклы.
         """
         if not ELEVENLABS_API_KEY:
-            logger.error(
-                f"[{self.stream_sid}] ELEVENLABS_API_KEY is not set, cannot start Scribe session"
-            )
+            logger.error("[%s] ELEVENLABS_API_KEY is not set, cannot start Scribe", self.stream_sid)
             return
 
-        config = {
+        params = {
             "model_id": "scribe_v2_realtime",
-            "audio_format": "ulaw_8000",   # под Twilio μ-law 8kHz :contentReference[oaicite:2]{index=2}
-            "sample_rate": 8000,
+            "audio_format": "pcm_16000",
             "commit_strategy": "vad",
             "vad_silence_threshold_secs": 0.5,
             "vad_threshold": 0.4,
             "min_speech_duration_ms": 100,
             "min_silence_duration_ms": 150,
-            "include_timestamps": False,
+            "include_timestamps": "false",
         }
 
-        logger.info(f"[{self.stream_sid}] Connecting Scribe Realtime with config={config}")
-        # Используем high-level helper из SDK, как в доках
-        # connection = await elevenlabs.speech_to_text.realtime.connect(config)
-        self.connection = await elevenlabs.speech_to_text.realtime.connect(config)
-
-        # Регистрируем обработчики событий
-        self.connection.on(RealtimeEvents.SESSION_STARTED, self._on_session_started)
-        self.connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, self._on_partial_transcript)
-        self.connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, self._on_committed_transcript)
-        self.connection.on(RealtimeEvents.ERROR, self._on_error)
-        self.connection.on(RealtimeEvents.AUTH_ERROR, self._on_auth_error)
-        self.connection.on(RealtimeEvents.QUOTA_EXCEEDED, self._on_quota_exceeded)
-        self.connection.on(RealtimeEvents.CLOSE, self._on_close)
-
-    async def push_audio(self, mulaw_bytes: bytes):
-        """
-        Получает μ-law 8kHz байты, кодирует в base64 и отправляет в Scribe.
-        """
-        if not mulaw_bytes or not self.connection or self._closed:
-            return
-
-        audio_b64 = base64.b64encode(mulaw_bytes).decode("ascii")
+        ws_url = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?" + urlencode(params)
+        logger.info("[%s] Connecting Scribe Realtime with params=%s", self.stream_sid, params)
 
         try:
-            await self.connection.send(
-                {
+            self._ws = await websockets.connect(
+                ws_url,
+                extra_headers={"xi-api-key": ELEVENLABS_API_KEY},
+                ping_interval=30,
+                ping_timeout=10,
+            )
+            logger.info("[%s] Scribe Realtime WebSocket connected", self.stream_sid)
+        except Exception as e:
+            logger.exception("[%s] Failed to connect to Scribe Realtime: %s", self.stream_sid, e)
+            return
+
+        # запускаем фоновые задачи
+        self._send_task = asyncio.create_task(self._send_loop())
+        self._recv_task = asyncio.create_task(self._recv_loop())
+
+    def push_audio(self, mulaw_bytes: bytes):
+        """
+        Получает μ-law 8kHz от Twilio, конвертирует в 16kHz PCM и кладёт в очередь.
+        """
+        if not mulaw_bytes or self._closed:
+            return
+
+        # μ-law 8k -> PCM16 8k
+        pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+
+        # 8k -> 16k
+        pcm16_16k, self._rate_state = audioop.ratecv(
+            pcm16_8k,
+            2,      # sample width
+            1,      # channels
+            8000,   # in_rate
+            16000,  # out_rate
+            self._rate_state,
+        )
+
+        try:
+            self._audio_queue.put_nowait(pcm16_16k)
+        except asyncio.QueueFull:
+            logger.warning("[%s] Scribe audio queue full, dropping chunk", self.stream_sid)
+
+    def stop(self):
+        """
+        Синхронный стоп: ставим флаг, гасим задачи и закрываем WebSocket.
+        Вызывается из Twilio-хэндлера без await.
+        """
+        if self._closed:
+            return
+
+        self._closed = True
+
+        # разблокировать send_loop
+        try:
+            self._audio_queue.put_nowait(b"")
+        except Exception:
+            pass
+
+        async def _cleanup():
+            if self._send_task:
+                self._send_task.cancel()
+            if self._recv_task:
+                self._recv_task.cancel()
+            if self._ws and not self._ws.closed:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    logger.exception("[%s] Error while closing Scribe WS", self.stream_sid)
+
+            logger.info("[%s] Scribe session stopped", self.stream_sid)
+
+        # Запускаем асинхронную очистку в текущем event loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_cleanup())
+        except RuntimeError:
+            # нет активного loop (на всякий случай) – игнорируем
+            pass
+
+    async def _send_loop(self):
+        assert self._ws is not None
+        try:
+            while not self._closed:
+                chunk = await self._audio_queue.get()
+                if not chunk or self._closed:
+                    break
+
+                if self._ws.closed:
+                    break
+
+                audio_b64 = base64.b64encode(chunk).decode("ascii")
+                msg = {
+                    "message_type": "input_audio_chunk",
                     "audio_base_64": audio_b64,
-                    "sample_rate": 8000,
+                    "sample_rate": 16000,
                 }
-            )
-        except Exception as e:
-            logger.exception(f"[{self.stream_sid}] Error sending audio to Scribe: {e}")
 
-    async def stop(self):
-        """
-        Завершаем сессию: коммитим остаток и закрываем WebSocket.
-        """
-        if not self.connection or self._closed:
-            return
+                try:
+                    await self._ws.send(json.dumps(msg))
+                except Exception as e:
+                    logger.exception("[%s] Error sending audio to Scribe: %s", self.stream_sid, e)
+                    break
+        finally:
+            logger.info("[%s] Scribe send loop finished", self.stream_sid)
 
+    async def _recv_loop(self):
+        assert self._ws is not None
         try:
-            # финальный коммит на всякий случай
-            await self.connection.commit()
+            async for raw in self._ws:
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    logger.warning("[%s] Non-JSON message from Scribe: %r", self.stream_sid, raw)
+                    continue
+
+                mtype = data.get("message_type")
+                text = data.get("text") or ""
+                lang_code = data.get("language_code")  # может и не быть
+
+                if mtype == "session_started":
+                    logger.info("[%s] Scribe session_started: %s", self.stream_sid, data)
+                elif mtype == "partial_transcript":
+                    if text:
+                        logger.info("[%s] Scribe partial: %r", self.stream_sid, text)
+                elif mtype in ("committed_transcript", "committed_transcript_with_timestamps"):
+                    logger.info("[%s] Scribe committed: %r (lang=%s)", self.stream_sid, text, lang_code)
+                    if self.on_final_callback and text:
+                        try:
+                            # handle_final_transcript(stream_sid, text, lang_raw)
+                            self.on_final_callback(self.stream_sid, text, lang_code)
+                        except Exception:
+                            logger.exception("[%s] Error in on_final_callback", self.stream_sid)
+                elif mtype and mtype.endswith("_error"):
+                    logger.error("[%s] Scribe error event: %s", self.stream_sid, data)
+                else:
+                    logger.debug("[%s] Scribe event %s: %s", self.stream_sid, mtype, data)
+
+        except (ConnectionClosedOK, ConnectionClosedError):
+            logger.info("[%s] Scribe websocket closed", self.stream_sid)
         except Exception as e:
-            logger.warning(
-                f"[{self.stream_sid}] Error on Scribe commit during stop: {e}"
-            )
-
-        try:
-            await self.connection.close()
-        except Exception as e:
-            logger.warning(
-                f"[{self.stream_sid}] Error while closing Scribe connection: {e}"
-            )
-
-        self._closed = True
-
-    # ----- callbacks -----
-
-    def _on_session_started(self, data):
-        logger.info(f"[{self.stream_sid}] Scribe session started: {data}")
-
-    def _on_partial_transcript(self, data):
-        text = getattr(data, "text", None)
-        if not text and isinstance(data, dict):
-            text = data.get("text")
-        if text:
-            logger.info(f"[{self.stream_sid}] Scribe partial: {text!r}")
-
-    def _on_committed_transcript(self, data):
-        # data может быть объектом или dict — подстрахуемся
-        text = getattr(data, "text", None)
-        if not text and isinstance(data, dict):
-            text = data.get("text")
-        if not text:
-            return
-
-        logger.info(f"[{self.stream_sid}] Scribe committed: {text!r}")
-
-        # Scribe может возвращать language_code, но можно просто передавать None,
-        # т.к. GPT сам по тексту поймёт RU/LV
-        lang_code = getattr(data, "language_code", None)
-        lang_raw = lang_code
-
-        if self.on_final_callback:
-            try:
-                self.on_final_callback(self.stream_sid, text, lang_raw)
-            except Exception as e:
-                logger.exception(
-                    f"[{self.stream_sid}] Error in on_final_callback: {e}"
-                )
-
-    def _on_error(self, error):
-        logger.error(f"[{self.stream_sid}] Scribe ERROR: {error}")
-
-    def _on_auth_error(self, error):
-        logger.error(f"[{self.stream_sid}] Scribe AUTH_ERROR: {error}")
-
-    def _on_quota_exceeded(self, error):
-        logger.error(f"[{self.stream_sid}] Scribe QUOTA_EXCEEDED: {error}")
-
-    def _on_close(self, *args, **kwargs):
-        logger.info(f"[{self.stream_sid}] Scribe connection closed")
-        self._closed = True
+            logger.exception("[%s] Scribe recv loop error: %s", self.stream_sid, e)
+        finally:
+            self._closed = True
+            logger.info("[%s] Scribe recv loop finished", self.stream_sid)
 
 
 # ====  Twilio Media Stream: WebSocket с аудио  ====
@@ -310,7 +359,7 @@ async def twilio_stream(ws: WebSocket):
                     stream_sid,
                     on_final_callback=handle_final_transcript,
                 )
-                await session.start()
+                asyncio.create_task(session.start())
                 stt_sessions[stream_sid] = session
 
                 # приветствие (TTS → Twilio)
@@ -337,16 +386,12 @@ async def twilio_stream(ws: WebSocket):
             elif event == "stop":
                 logger.info(f"Twilio stream STOP streamSid={stream_sid}")
                 if stream_sid and stream_sid in stt_sessions:
-                    try:
-                        await stt_sessions[stream_sid].stop()
-                    finally:
-                        del stt_sessions[stream_sid]
+                    stt_sessions[stream_sid].stop()
+                    del stt_sessions[stream_sid]
 
-                # чистим Twilio WebSocket для этого streamSid
                 if stream_sid and stream_sid in twilio_connections:
                     del twilio_connections[stream_sid]
 
-                # чистим мету
                 if stream_sid and stream_sid in stream_meta:
                     del stream_meta[stream_sid]
 
@@ -360,14 +405,8 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         logger.exception(f"Error in twilio_stream: {e}")
     finally:
-        # на всякий случай чистим сессию, если осталась
         if stream_sid and stream_sid in stt_sessions:
-            try:
-                await stt_sessions[stream_sid].stop()
-            except Exception:
-                logger.exception(
-                    f"[{stream_sid}] Error while stopping STT session in finally"
-                )
+            stt_sessions[stream_sid].stop()
             del stt_sessions[stream_sid]
 
         if stream_sid and stream_sid in twilio_connections:
