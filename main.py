@@ -5,6 +5,7 @@ import logging
 import time
 import audioop
 import asyncio
+import httpx
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -82,6 +83,8 @@ llm_sessions: dict[str, "LLMConversation"] = {}
 # Хранилище Twilio WebSocket + event loop по streamSid (для отправки TTS)
 twilio_connections: dict[str, tuple[WebSocket, asyncio.AbstractEventLoop]] = {}
 
+# Мета-инфа по стримам: времена и т.п.
+stream_meta: dict[str, dict] = {}
 
 # ====  OpenAI LLM  ====
 class LLMConversation:
@@ -303,6 +306,11 @@ async def twilio_stream(ws: WebSocket):
                 stream_sid = start_info["streamSid"]
                 logger.info(f"Twilio stream START streamSid={stream_sid}")
 
+                # сохраняем момент получения START (для замера до приветствия)
+                stream_meta[stream_sid] = {
+                    "start_ts": time.perf_counter(),
+                }
+
                 twilio_connections[stream_sid] = (ws, loop)
 
                 # создаём STT сессию под этот streamSid
@@ -314,6 +322,12 @@ async def twilio_stream(ws: WebSocket):
                     stream_sid,
                     on_final_callback=handle_final_transcript,
                 )
+
+                greeting_text = (
+                    "Labdien! Jūs sazvanījāt palīgu. "
+                )
+                await send_initial_greeting(ws, stream_sid, greeting_text)
+                # -----------------------------------------------
 
             elif event == "media":
                 if first_media_ts is None:
@@ -341,6 +355,9 @@ async def twilio_stream(ws: WebSocket):
                 # чистим Twilio WebSocket для этого streamSid
                 if stream_sid and stream_sid in twilio_connections:
                     del twilio_connections[stream_sid]
+
+                if stream_sid and stream_sid in stream_meta:
+                    del stream_meta[stream_sid]
 
                 break
 
@@ -518,3 +535,79 @@ def stream_tts_to_twilio(stream_sid: str, text: str):
 
     except Exception as e:
         logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")
+
+
+async def send_initial_greeting(ws: WebSocket, stream_sid: str, text: str):
+    """
+    Отправляет фиксированное приветствие через ElevenLabs в Twilio.
+    Логирует момент отправки первого аудиофрейма (для замера задержки).
+    """
+    if not ELEVENLABS_API_KEY:
+        logger.warning("ELEVENLABS_API_KEY not set, skip initial greeting TTS")
+        return
+
+    meta = stream_meta.get(stream_sid, {})
+    start_ts = meta.get("start_ts")  # когда пришёл event=start
+
+    logger.info(
+        f"[{stream_sid}] GREETING TTS: sending fixed greeting to ElevenLabs "
+        f"(len={len(text)} chars)"
+    )
+
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    params = {"output_format": "ulaw_8000"}
+    payload = {
+        "text": text,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.0,
+            "use_speaker_boost": "true",
+            "speed": 1.3
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream",
+                headers=headers,
+                params=params,
+                json=payload,
+            ) as resp:
+                resp.raise_for_status()
+
+                first_chunk = True
+
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+
+                    if first_chunk:
+                        first_chunk = False
+                        if start_ts is not None:
+                            dt = time.perf_counter() - start_ts
+                            logger.info(
+                                f"[{stream_sid}] GREETING: first audio chunk "
+                                f"from ElevenLabs, {dt:.3f}s since stream START"
+                            )
+                        else:
+                            logger.info(
+                                f"[{stream_sid}] GREETING: first audio chunk from ElevenLabs"
+                            )
+
+                    payload_b64 = base64.b64encode(chunk).decode("ascii")
+                    msg = {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": payload_b64},
+                    }
+                    await ws.send_text(json.dumps(msg))
+
+        logger.info(f"[{stream_sid}] GREETING: TTS stream finished")
+
+    except Exception as e:
+        logger.exception(f"[{stream_sid}] GREETING TTS error: {e}")
