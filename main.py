@@ -12,6 +12,7 @@ from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
+from starlette.websockets import WebSocketState
 
 import azure.cognitiveservices.speech as speechsdk
 
@@ -323,10 +324,7 @@ async def twilio_stream(ws: WebSocket):
                     on_final_callback=handle_final_transcript,
                 )
 
-                greeting_text = (
-                    "Labdien! Jūs sazvanījāt palīgu. "
-                )
-                await send_initial_greeting(ws, stream_sid, greeting_text)
+                asyncio.create_task(send_initial_greeting(ws, stream_sid))
                 # -----------------------------------------------
 
             elif event == "media":
@@ -355,7 +353,8 @@ async def twilio_stream(ws: WebSocket):
                 # чистим Twilio WebSocket для этого streamSid
                 if stream_sid and stream_sid in twilio_connections:
                     del twilio_connections[stream_sid]
-
+                    
+                # чистим мету
                 if stream_sid and stream_sid in stream_meta:
                     del stream_meta[stream_sid]
 
@@ -537,77 +536,88 @@ def stream_tts_to_twilio(stream_sid: str, text: str):
         logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")
 
 
-async def send_initial_greeting(ws: WebSocket, stream_sid: str, text: str):
+async def send_initial_greeting(ws: WebSocket, stream_sid: str):
+    greeting_text = (
+        "Labdien! Esmu virtuālais palīgs. "
+    )
+    logger.info(f"[{stream_sid}] GREETING TTS: starting greeting")
+    await eleven_stream_tts_to_twilio(ws, stream_sid, greeting_text, prefix="GREETING TTS")
+
+async def eleven_stream_tts_to_twilio(
+    ws: WebSocket,
+    stream_sid: str,
+    text: str,
+    prefix: str = "TTS",
+):
     """
-    Отправляет фиксированное приветствие через ElevenLabs в Twilio.
-    Логирует момент отправки первого аудиофрейма (для замера задержки).
+    Стримим ответ из ElevenLabs в Twilio Media Stream.
+    Используем U-Law 8kHz, чтобы не перекодировать.
     """
     if not ELEVENLABS_API_KEY:
-        logger.warning("ELEVENLABS_API_KEY not set, skip initial greeting TTS")
+        logger.error("ELEVEN_API_KEY is not set")
         return
 
-    meta = stream_meta.get(stream_sid, {})
-    start_ts = meta.get("start_ts")  # когда пришёл event=start
-
-    logger.info(
-        f"[{stream_sid}] GREETING TTS: sending fixed greeting to ElevenLabs "
-        f"(len={len(text)} chars)"
-    )
-
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+    params = {"output_format": "ulaw_8000"}
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    params = {"output_format": "ulaw_8000"}
+
     payload = {
         "text": text,
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.0,
-            "use_speaker_boost": "true",
-            "speed": 1.3
-        },
+        "model_id": ELEVENLABS_MODEL_ID,  # ⚠ ОБЯЗАТЕЛЬНО
+        # "voice_settings": {
+        #     "stability": 0.5,
+        #     "similarity_byle": 0.0,
+        #     "use_speaker_boost": True,
+        # },
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream",
-                headers=headers,
-                params=params,
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
+    logger.info(
+        f"[{stream_sid}] {prefix}: sending text to ElevenLabs (len={len(text)} chars)"
+    )
 
-                first_chunk = True
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            url,
+            headers=headers,
+            params=params,
+            json=payload,  # ⚠ именно json, не data
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                logger.error(
+                    f"[{stream_sid}] {prefix} error: ElevenLabs HTTP {resp.status_code}, body={body!r}"
+                )
+                return
 
-                async for chunk in resp.aiter_bytes():
-                    if not chunk:
-                        continue
+            # первая порция аудио – удобно для измерения латентности
+            first_chunk_sent = False
 
-                    if first_chunk:
-                        first_chunk = False
-                        if start_ts is not None:
-                            dt = time.perf_counter() - start_ts
-                            logger.info(
-                                f"[{stream_sid}] GREETING: first audio chunk "
-                                f"from ElevenLabs, {dt:.3f}s since stream START"
-                            )
-                        else:
-                            logger.info(
-                                f"[{stream_sid}] GREETING: first audio chunk from ElevenLabs"
-                            )
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
 
-                    payload_b64 = base64.b64encode(chunk).decode("ascii")
-                    msg = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": payload_b64},
-                    }
-                    await ws.send_text(json.dumps(msg))
+                if ws.client_state != WebSocketState.CONNECTED:
+                    logger.info(
+                        f"[{stream_sid}] {prefix}: WebSocket already closed, stop sending audio"
+                    )
+                    break
 
-        logger.info(f"[{stream_sid}] GREETING: TTS stream finished")
+                if not first_chunk_sent:
+                    logger.info(
+                        f"[{stream_sid}] {prefix}: first audio chunk ready to send to Twilio"
+                    )
+                    first_chunk_sent = True
 
-    except Exception as e:
-        logger.exception(f"[{stream_sid}] GREETING TTS error: {e}")
+                msg = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": base64.b64encode(chunk).decode("ascii"),
+                    },
+                }
+                await ws.send_text(json.dumps(msg))
