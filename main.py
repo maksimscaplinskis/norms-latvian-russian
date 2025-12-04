@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import logging
+import time
 import audioop
 import asyncio
 
@@ -28,6 +29,18 @@ if not SPEECH_KEY or not SPEECH_REGION:
 speech_config = speechsdk.SpeechConfig(
     subscription=SPEECH_KEY,
     region=SPEECH_REGION,
+)
+
+# Сделать сегментацию более агрессивной (быстрее отдавать final)
+speech_config.set_property(
+    speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+    "500"  # 500 мс тишины после фразы – можно уменьшать/увеличивать
+)
+
+# Повысить чувствительность к началу речи
+speech_config.set_property(
+    speechsdk.PropertyId.Speech_StartEventSensitivity,
+    "high"
 )
 
 # Авто-определение RU / LV
@@ -69,6 +82,7 @@ llm_sessions: dict[str, "LLMConversation"] = {}
 # Хранилище Twilio WebSocket + event loop по streamSid (для отправки TTS)
 twilio_connections: dict[str, tuple[WebSocket, asyncio.AbstractEventLoop]] = {}
 
+first_media_ts = None
 
 # ====  OpenAI LLM  ====
 class LLMConversation:
@@ -249,6 +263,17 @@ class AzureSTTSession:
         elif result.reason == speechsdk.ResultReason.NoMatch:
             logger.info(f"[{self.stream_sid}] NoMatch: {result.no_match_details}")
 
+        latency_ms = result.properties.get(
+            speechsdk.PropertyId.SpeechServiceResponse_RecognitionLatencyMs
+        )
+        logger.info(
+            "[%s] Azure STT final (%s): '%s' (recognition_latency=%sms)",
+            self.stream_sid,
+            lang_raw,
+            text,
+            latency_ms,
+        )
+
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs):
         logger.warning(
             f"[{self.stream_sid}] CANCELED: reason={evt.reason}, "
@@ -292,6 +317,10 @@ async def twilio_stream(ws: WebSocket):
                 )
 
             elif event == "media":
+                if first_media_ts is None:
+                    first_media_ts = time.perf_counter()
+                    logger.info("[%s] First media frame from Twilio", stream_sid)
+
                 if not stream_sid:
                     # на всякий случай
                     logger.warning("Got media before start; skipping")
