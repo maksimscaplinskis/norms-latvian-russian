@@ -142,7 +142,7 @@ class ScribeRealtimeSession:
         self.on_final_callback = on_final_callback
 
         self._rate_state = None
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._send_task: asyncio.Task | None = None
@@ -187,8 +187,10 @@ class ScribeRealtimeSession:
     def push_audio(self, mulaw_bytes: bytes):
         if not mulaw_bytes or self._closed:
             return
-        # unbounded queue - тут почти нечему ломаться
-        self._audio_queue.put_nowait(mulaw_bytes)
+        try:
+            self._audio_queue.put_nowait(mulaw_bytes)
+        except asyncio.QueueFull:
+            logger.warning("[%s] Scribe audio queue full, dropping chunk", self.stream_sid)
 
     def stop(self):
         """
@@ -200,9 +202,9 @@ class ScribeRealtimeSession:
 
         self._closed = True
 
-        # разблокировать send_loop
+        # разблокировать send_loop, если он ждёт .get()
         try:
-            self._audio_queue.put_nowait(b"")
+            self._audio_queue.put_nowait(b"")  # теперь это просто "будилка"
         except Exception:
             pass
 
@@ -219,6 +221,12 @@ class ScribeRealtimeSession:
 
             logger.info("[%s] Scribe session stopped", self.stream_sid)
 
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_cleanup())
+        except RuntimeError:
+            pass
+
         # Запускаем асинхронную очистку в текущем event loop
         try:
             loop = asyncio.get_running_loop()
@@ -230,11 +238,18 @@ class ScribeRealtimeSession:
     async def _send_loop(self):
         assert self._ws is not None
         try:
-            while not self._closed:
+            while True:
                 chunk = await self._audio_queue.get()
-                if not chunk or self._closed:
+
+                # если нас попросили остановиться — выходим
+                if self._closed:
                     break
 
+                # пустые чанки просто игнорируем
+                if not chunk:
+                    continue
+
+                # если WS умер — тоже выходим
                 if self._ws.closed:
                     break
 
@@ -242,7 +257,7 @@ class ScribeRealtimeSession:
                 msg = {
                     "message_type": "input_audio_chunk",
                     "audio_base_64": audio_b64,
-                    "sample_rate": 8000,  # теперь 8 kHz
+                    "sample_rate": 8000,
                 }
 
                 try:
