@@ -82,7 +82,6 @@ llm_sessions: dict[str, "LLMConversation"] = {}
 # Хранилище Twilio WebSocket + event loop по streamSid (для отправки TTS)
 twilio_connections: dict[str, tuple[WebSocket, asyncio.AbstractEventLoop]] = {}
 
-first_media_ts = None
 
 # ====  OpenAI LLM  ====
 class LLMConversation:
@@ -289,6 +288,8 @@ async def twilio_stream(ws: WebSocket):
 
     stream_sid = None
     loop = asyncio.get_running_loop()
+
+    first_media_ts = None
 
     try:
         while True:
