@@ -4,12 +4,10 @@ import base64
 import logging
 import time
 import asyncio
-import httpx
-import audioop
 import websockets
 from urllib.parse import urlencode
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
-
+import httpx
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -161,7 +159,7 @@ class ScribeRealtimeSession:
 
         params = {
             "model_id": "scribe_v2_realtime",
-            "audio_format": "pcm_16000",
+            "audio_format": "mulaw_8000",
             "commit_strategy": "vad",
             "vad_silence_threshold_secs": 0.5,
             "vad_threshold": 0.4,
@@ -190,27 +188,10 @@ class ScribeRealtimeSession:
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     def push_audio(self, mulaw_bytes: bytes):
-        """
-        Получает μ-law 8kHz от Twilio, конвертирует в 16kHz PCM и кладёт в очередь.
-        """
         if not mulaw_bytes or self._closed:
             return
-
-        # μ-law 8k -> PCM16 8k
-        pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)
-
-        # 8k -> 16k
-        pcm16_16k, self._rate_state = audioop.ratecv(
-            pcm16_8k,
-            2,      # sample width
-            1,      # channels
-            8000,   # in_rate
-            16000,  # out_rate
-            self._rate_state,
-        )
-
         try:
-            self._audio_queue.put_nowait(pcm16_16k)
+            self._audio_queue.put_nowait(mulaw_bytes)
         except asyncio.QueueFull:
             logger.warning("[%s] Scribe audio queue full, dropping chunk", self.stream_sid)
 
@@ -266,7 +247,7 @@ class ScribeRealtimeSession:
                 msg = {
                     "message_type": "input_audio_chunk",
                     "audio_base_64": audio_b64,
-                    "sample_rate": 16000,
+                    "sample_rate": 8000,  # теперь 8 kHz
                 }
 
                 try:
