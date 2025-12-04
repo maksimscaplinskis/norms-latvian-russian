@@ -250,6 +250,15 @@ class AzureSTTSession:
                 f"[{self.stream_sid}] Recognized (final) [lang={lang_raw}]: {text!r}"
             )
 
+            latency_ms = props.get(
+                speechsdk.PropertyId.SpeechServiceResponse_RecognitionLatencyMs
+            )
+
+            logger.info(
+                "[%s] Recognized (final) [lang=%s, latency=%sms]: %r",
+                self.stream_sid, lang_raw, latency_ms, text
+            )
+
             # Вызовем колбэк (LLM)
             if self.on_final_callback and text:
                 try:
@@ -261,17 +270,6 @@ class AzureSTTSession:
 
         elif result.reason == speechsdk.ResultReason.NoMatch:
             logger.info(f"[{self.stream_sid}] NoMatch: {result.no_match_details}")
-
-        latency_ms = result.properties.get(
-            speechsdk.PropertyId.SpeechServiceResponse_RecognitionLatencyMs
-        )
-        logger.info(
-            "[%s] Azure STT final (%s): '%s' (recognition_latency=%sms)",
-            self.stream_sid,
-            lang_raw,
-            text,
-            latency_ms,
-        )
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs):
         logger.warning(
