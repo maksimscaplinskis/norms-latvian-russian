@@ -142,7 +142,7 @@ class ScribeRealtimeSession:
         self.on_final_callback = on_final_callback
 
         self._rate_state = None
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._send_task: asyncio.Task | None = None
@@ -187,10 +187,8 @@ class ScribeRealtimeSession:
     def push_audio(self, mulaw_bytes: bytes):
         if not mulaw_bytes or self._closed:
             return
-        try:
-            self._audio_queue.put_nowait(mulaw_bytes)
-        except asyncio.QueueFull:
-            logger.warning("[%s] Scribe audio queue full, dropping chunk", self.stream_sid)
+        # unbounded queue - тут почти нечему ломаться
+        self._audio_queue.put_nowait(mulaw_bytes)
 
     def stop(self):
         """
