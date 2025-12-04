@@ -159,7 +159,7 @@ class ScribeRealtimeSession:
 
         params = {
             "model_id": "scribe_v2_realtime",
-            "audio_format": "mulaw_8000",
+            "audio_format": "ulaw_8000",
             "commit_strategy": "vad",
             "vad_silence_threshold_secs": 0.5,
             "vad_threshold": 0.4,
@@ -174,16 +174,13 @@ class ScribeRealtimeSession:
         try:
             self._ws = await websockets.connect(
                 ws_url,
-                extra_headers={"xi-api-key": ELEVENLABS_API_KEY},
-                ping_interval=30,
-                ping_timeout=10,
+                additional_headers={"xi-api-key": ELEVENLABS_API_KEY},
             )
             logger.info("[%s] Scribe Realtime WebSocket connected", self.stream_sid)
         except Exception as e:
             logger.exception("[%s] Failed to connect to Scribe Realtime: %s", self.stream_sid, e)
             return
 
-        # запускаем фоновые задачи
         self._send_task = asyncio.create_task(self._send_loop())
         self._recv_task = asyncio.create_task(self._recv_loop())
 
@@ -362,7 +359,7 @@ async def twilio_stream(ws: WebSocket):
                 session = stt_sessions.get(stream_sid)
                 if session:
                     # отправляем аудио в Scribe
-                    await session.push_audio(mulaw_bytes)
+                    session.push_audio(mulaw_bytes)
 
             elif event == "stop":
                 logger.info(f"Twilio stream STOP streamSid={stream_sid}")
@@ -625,12 +622,6 @@ async def eleven_stream_tts_to_twilio(
                     )
                     break
 
-                if not first_chunk_sent:
-                    logger.info(
-                        f"[{stream_sid}] {prefix}: first audio chunk ready to send to Twilio"
-                    )
-                    first_chunk_sent = True
-
                 msg = {
                     "event": "media",
                     "streamSid": stream_sid,
@@ -638,4 +629,14 @@ async def eleven_stream_tts_to_twilio(
                         "payload": base64.b64encode(chunk).decode("ascii"),
                     },
                 }
-                await ws.send_text(json.dumps(msg))
+
+                try:
+                    await ws.send_text(json.dumps(msg))
+                except RuntimeError as e:
+                    logger.warning(
+                        f"[{stream_sid}] {prefix}: failed to send chunk (WS closed): {e}"
+                    )
+                    break
+                except Exception:
+                    logger.exception(f"[{stream_sid}] {prefix}: unexpected error while sending chunk")
+                    break
