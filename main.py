@@ -87,9 +87,6 @@ twilio_connections: dict[str, tuple[WebSocket, asyncio.AbstractEventLoop]] = {}
 # Мета-инфа по стримам: времена и т.п.
 stream_meta: dict[str, dict] = {}
 
-# Все активные задачи TTS (ElevenLabs → Twilio) по streamSid
-tts_tasks: dict[str, asyncio.Task] = {}
-
 # ====  OpenAI LLM  ====
 class LLMConversation:
     """
@@ -104,11 +101,11 @@ class LLMConversation:
         system_prompt = (
             "Tu esi auto servisa balss asistents. "
             "Sākumā uzmanīgi noklausies klienta problēmu."
-            "Nosaki klienta valodu (latviešu vai krievu) pēc pirmajiem vārdiem un atbildi tikai šajā valodā. "
+            "Pēc pirmajiem vārdiem nosaki, vai klients runā latviski vai krieviski, un turpmāk runā tikai šajā valodā."
             "Runā īsiem, vienkāršiem teikumiem."
             "Kad saproti problēmu, piedāvā pierakstu uz auto pārbaudi un palīdz izvēlēties dienu un laiku."
             "Kad pieraksts apstiprināts, pateicies un pieklājīgi nobeidz sarunu."
-            "Neuzsāc atbildi ar sveicienu (piemēram, \"Labdien\", \"Sveiki\") — saruna jau ir sākusies."
+            "Nejautat klientam detalizetu specifiku par vina auto"
         )
         self.messages.append({"role": "system", "content": system_prompt})
 
@@ -234,8 +231,6 @@ class AzureSTTSession:
         text = result.text
         if not text:
             return
-        
-        cancel_tts(self.stream_sid, reason="barge-in on partial STT")
 
         lang = None
         # пробуем достать определённый язык
@@ -358,16 +353,14 @@ async def twilio_stream(ws: WebSocket):
                     stt_sessions[stream_sid].stop()
                     del stt_sessions[stream_sid]
 
-                if stream_sid and stream_sid in llm_sessions:
-                    del llm_sessions[stream_sid]
-
+                # чистим Twilio WebSocket для этого streamSid
                 if stream_sid and stream_sid in twilio_connections:
                     del twilio_connections[stream_sid]
-
+                    
+                # чистим мету
                 if stream_sid and stream_sid in stream_meta:
                     del stream_meta[stream_sid]
 
-                cancel_tts(stream_sid, reason="Twilio STOP")
                 break
 
             else:
@@ -378,17 +371,14 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         logger.exception(f"Error in twilio_stream: {e}")
     finally:
+        # на всякий случай чистим сессию, если осталась
         if stream_sid and stream_sid in stt_sessions:
             stt_sessions[stream_sid].stop()
             del stt_sessions[stream_sid]
 
-        if stream_sid and stream_sid in llm_sessions:
-            del llm_sessions[stream_sid]
-
         if stream_sid and stream_sid in twilio_connections:
             del twilio_connections[stream_sid]
 
-        cancel_tts(stream_sid, reason="WebSocket finally/close")
         logger.info("Twilio handler finished")
 
 
@@ -452,127 +442,109 @@ def handle_final_transcript(stream_sid: str, text: str, lang_raw: str | None):
     if reply_text:
         logger.info(f"[{stream_sid}] LLM reply ready (for TTS): {reply_text!r}")
 
-        conn = twilio_connections.get(stream_sid)
-        if not conn:
-            logger.warning(f"[{stream_sid}] No Twilio connection found for TTS playback")
-            return
+        # сразу запускаем стрим TTS -> Twilio
+        try:
+            stream_tts_to_twilio(stream_sid, reply_text)
+        except Exception as e:
+            logger.exception(f"[{stream_sid}] Error while streaming TTS: {e}")
 
-        ws, loop = conn
 
-        # Запускаем TTS внутри event loop, а не из потока Azure
-        loop.call_soon_threadsafe(
-            start_tts_playback, ws, stream_sid, reply_text, "LLM TTS"
+def stream_tts_to_twilio(stream_sid: str, text: str):
+    """
+    Сгенерировать речь через ElevenLabs и постримить её в Twilio как
+    media-сообщения (mulaw/8000 base64) в bidirectional Media Stream.
+    Работает из обычного (не-async) потока.
+    """
+    if not eleven_client:
+        logger.warning(f"[{stream_sid}] ElevenLabs client not initialized, skip TTS")
+        return
+    if not ELEVENLABS_VOICE_ID:
+        logger.warning(f"[{stream_sid}] ELEVENLABS_VOICE_ID is not set, skip TTS")
+        return
+
+    conn = twilio_connections.get(stream_sid)
+    if not conn:
+        logger.warning(f"[{stream_sid}] No Twilio WebSocket for this streamSid, cannot send TTS")
+        return
+
+    ws, loop = conn
+
+    logger.info(f"[{stream_sid}] TTS: sending text to ElevenLabs ({len(text)} chars)")
+
+    try:
+        # Важно: формат ulaw_8000 – Twilio требует audio/x-mulaw 8kHz, base64.
+        audio_stream = eleven_client.text_to_speech.stream(
+            voice_id=ELEVENLABS_VOICE_ID,
+            model_id=ELEVENLABS_MODEL_ID,
+            text=text,
+            output_format="ulaw_8000",
+            voice_settings=VoiceSettings(
+                stability=0.5,
+                similarity_byle=0.0,
+                use_speaker_boost=True,
+                speed=1.3,
+            ),
         )
 
+        for chunk in audio_stream:
+            # если чанк пустой или это не байты — пропускаем
+            if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                continue
 
-# def stream_tts_to_twilio(stream_sid: str, text: str):
-#     """
-#     Сгенерировать речь через ElevenLabs и постримить её в Twilio как
-#     media-сообщения (mulaw/8000 base64) в bidirectional Media Stream.
-#     Работает из обычного (не-async) потока.
-#     """
-#     if not eleven_client:
-#         logger.warning(f"[{stream_sid}] ElevenLabs client not initialized, skip TTS")
-#         return
-#     if not ELEVENLABS_VOICE_ID:
-#         logger.warning(f"[{stream_sid}] ELEVENLABS_VOICE_ID is not set, skip TTS")
-#         return
+            # если Twilio уже отписался (stop/close) — выходим из цикла
+            if stream_sid not in twilio_connections:
+                logger.info(f"[{stream_sid}] Twilio connection gone, stop TTS streaming")
+                break
 
-#     conn = twilio_connections.get(stream_sid)
-#     if not conn:
-#         logger.warning(f"[{stream_sid}] No Twilio WebSocket for this streamSid, cannot send TTS")
-#         return
+            payload_b64 = base64.b64encode(chunk).decode("ascii")
 
-#     ws, loop = conn
+            def _schedule_send(payload=payload_b64):
+                """
+                Этот код выполняется уже внутри event loop.
+                Здесь ещё раз проверяем, что соединение живое,
+                и отлавливаем ошибки отправки.
+                """
+                conn_inner = twilio_connections.get(stream_sid)
+                if not conn_inner:
+                    # стрим уже закрыт / удалён
+                    return
 
-#     logger.info(f"[{stream_sid}] TTS: sending text to ElevenLabs ({len(text)} chars)")
+                ws_inner, _ = conn_inner
 
-#     try:
-#         # Важно: формат ulaw_8000 – Twilio требует audio/x-mulaw 8kHz, base64.
-#         audio_stream = eleven_client.text_to_speech.stream(
-#             voice_id=ELEVENLABS_VOICE_ID,
-#             model_id=ELEVENLABS_MODEL_ID,
-#             text=text,
-#             output_format="ulaw_8000",
-#             voice_settings=VoiceSettings(
-#                 stability=0.5,
-#                 similarity_byle=0.0,
-#                 use_speaker_boost=True,
-#                 speed=1.3,
-#             ),
-#         )
+                async def _send_chunk():
+                    if ws_inner.application_state.name != "CONNECTED":
+                        # WebSocket уже закрыт — ничего не делаем
+                        return
 
-#         for chunk in audio_stream:
-#             # если чанк пустой или это не байты — пропускаем
-#             if not chunk or not isinstance(chunk, (bytes, bytearray)):
-#                 continue
+                    msg = {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": payload},
+                    }
 
-#             # если Twilio уже отписался (stop/close) — выходим из цикла
-#             if stream_sid not in twilio_connections:
-#                 logger.info(f"[{stream_sid}] Twilio connection gone, stop TTS streaming")
-#                 break
+                    try:
+                        await ws_inner.send_text(json.dumps(msg))
+                    except RuntimeError as e:
+                        # Классический случай: "Unexpected ASGI message 'websocket.send'..."
+                        logger.warning(f"[{stream_sid}] TTS chunk send failed (WS closed): {e}")
+                    except Exception:
+                        logger.exception(f"[{stream_sid}] Unexpected error while sending TTS chunk")
 
-#             payload_b64 = base64.b64encode(chunk).decode("ascii")
+                asyncio.create_task(_send_chunk())
 
-#             def _schedule_send(payload=payload_b64):
-#                 """
-#                 Этот код выполняется уже внутри event loop.
-#                 Здесь ещё раз проверяем, что соединение живое,
-#                 и отлавливаем ошибки отправки.
-#                 """
-#                 conn_inner = twilio_connections.get(stream_sid)
-#                 if not conn_inner:
-#                     # стрим уже закрыт / удалён
-#                     return
+            # планируем отправку чанка в event loop из текущего потока
+            loop.call_soon_threadsafe(_schedule_send)
 
-#                 ws_inner, _ = conn_inner
-
-#                 async def _send_chunk():
-#                     if ws_inner.application_state.name != "CONNECTED":
-#                         # WebSocket уже закрыт — ничего не делаем
-#                         return
-
-#                     msg = {
-#                         "event": "media",
-#                         "streamSid": stream_sid,
-#                         "media": {"payload": payload},
-#                     }
-
-#                     try:
-#                         await ws_inner.send_text(json.dumps(msg))
-#                     except RuntimeError as e:
-#                         # Классический случай: "Unexpected ASGI message 'websocket.send'..."
-#                         logger.warning(f"[{stream_sid}] TTS chunk send failed (WS closed): {e}")
-#                     except Exception:
-#                         logger.exception(f"[{stream_sid}] Unexpected error while sending TTS chunk")
-
-#                 asyncio.create_task(_send_chunk())
-
-#             # планируем отправку чанка в event loop из текущего потока
-#             loop.call_soon_threadsafe(_schedule_send)
-
-#     except Exception as e:
-#         logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")
+    except Exception as e:
+        logger.exception(f"[{stream_sid}] ElevenLabs TTS error: {e}")
 
 
 async def send_initial_greeting(ws: WebSocket, stream_sid: str):
     greeting_text = (
-        "Autoserviss Pronto! Klausos. "
+        "Labdien! Esmu virtuālais autoservisa palīgs. "
     )
     logger.info(f"[{stream_sid}] GREETING TTS: starting greeting")
-
-    # 1) Озвучиваем приветствие через ElevenLabs
-    start_tts_playback(ws, stream_sid, greeting_text, prefix="GREETING TTS")
-
-    # 2) Кладём приветствие в контекст GPT как уже сказанную фразу ассистента
-    if stream_sid not in llm_sessions:
-        llm_sessions[stream_sid] = LLMConversation(stream_sid)
-
-    conv = llm_sessions[stream_sid]
-    conv.messages.append({
-        "role": "assistant",
-        "content": greeting_text,
-    })
+    await eleven_stream_tts_to_twilio(ws, stream_sid, greeting_text, prefix="GREETING TTS")
 
 async def eleven_stream_tts_to_twilio(
     ws: WebSocket,
@@ -610,76 +582,45 @@ async def eleven_stream_tts_to_twilio(
         f"[{stream_sid}] {prefix}: sending text to ElevenLabs (len={len(text)} chars)"
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                url,
-                headers=headers,
-                params=params,
-                json=payload,
-            ) as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    logger.error(
-                        f"[{stream_sid}] {prefix} error: ElevenLabs HTTP {resp.status_code}, body={body!r}"
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            url,
+            headers=headers,
+            params=params,
+            json=payload,  # ⚠ именно json, не data
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                logger.error(
+                    f"[{stream_sid}] {prefix} error: ElevenLabs HTTP {resp.status_code}, body={body!r}"
+                )
+                return
+
+            # первая порция аудио – удобно для измерения латентности
+            first_chunk_sent = False
+
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+
+                if ws.client_state != WebSocketState.CONNECTED:
+                    logger.info(
+                        f"[{stream_sid}] {prefix}: WebSocket already closed, stop sending audio"
                     )
-                    return
+                    break
 
-                first_chunk_sent = False
+                if not first_chunk_sent:
+                    logger.info(
+                        f"[{stream_sid}] {prefix}: first audio chunk ready to send to Twilio"
+                    )
+                    first_chunk_sent = True
 
-                async for chunk in resp.aiter_bytes():
-                    if not chunk:
-                        continue
-
-                    if ws.application_state != WebSocketState.CONNECTED:
-                        logger.info(
-                            f"[{stream_sid}] {prefix}: WebSocket already closed, stop sending audio"
-                        )
-                        break
-
-                    if not first_chunk_sent:
-                        logger.info(
-                            f"[{stream_sid}] {prefix}: first audio chunk ready to send to Twilio"
-                        )
-                        first_chunk_sent = True
-
-                    msg = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {
-                            "payload": base64.b64encode(chunk).decode("ascii"),
-                        },
-                    }
-                    await ws.send_text(json.dumps(msg))
-
-    except asyncio.CancelledError:
-        # Нормальная ситуация при barge-in или stop — не считаем ошибкой
-        logger.info(f"[{stream_sid}] {prefix}: TTS task cancelled (barge-in or hangup)")
-        raise
-    except Exception as e:
-        logger.exception(f"[{stream_sid}] {prefix}: unexpected error in TTS: {e}")
-
-def cancel_tts(stream_sid: str, reason: str = "unknown"):
-    """
-    Останавливает текущую TTS-задачу для указанного streamSid (если есть).
-    Используется для barge-in и при закрытии звонка.
-    """
-    task = tts_tasks.get(stream_sid)
-    if task and not task.done():
-        task.cancel()
-        logger.info(f"[{stream_sid}] TTS cancelled: {reason}")
-
-
-def start_tts_playback(ws: WebSocket, stream_sid: str, text: str, prefix: str = "TTS"):
-    """
-    Запускает новую TTS-задачу ElevenLabs → Twilio.
-    Предварительно гасит старую (чтобы не было двух голосов одновременно).
-    """
-    # Сначала гасим предыдущую озвучку, если ещё играет
-    cancel_tts(stream_sid, reason="start new TTS")
-
-    task = asyncio.create_task(
-        eleven_stream_tts_to_twilio(ws, stream_sid, text, prefix=prefix)
-    )
-    tts_tasks[stream_sid] = task
+                msg = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": base64.b64encode(chunk).decode("ascii"),
+                    },
+                }
+                await ws.send_text(json.dumps(msg))
