@@ -45,7 +45,10 @@ SYSTEM_PROMPT = (
 )
 
 GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
-SPEECH_ENERGY_THRESHOLD = 30.0  # стартовый порог, будем смотреть по логам
+
+# VAD-параметры
+VAD_MARGIN = 35.0          # запас над базовым уровнем шума
+VAD_CONSEC_FRAMES = 3      # сколько подряд кадров > порога для barge-in
 
 # ============================
 #   STT: Soniox
@@ -218,6 +221,10 @@ class CallSession:
         self.stt = SttSession(SONIOX_API_KEY)
         self.tts = TtsSession(eleven_client, ws, self.loop)
 
+        # --- VAD-состояние ---
+        self.vad_noise_level: float | None = None
+        self.vad_over_thr_count: int = 0
+
         # контекст для GPT
         self.messages = [
             {
@@ -243,10 +250,9 @@ class CallSession:
         acc = 0
         n = len(audio_bytes)
         for b in audio_bytes:
-            diff = b - 128  # центр
+            diff = b - 128  # центр для μ-law байтов
             acc += diff * diff
 
-        # корень из средней квадратичной — RMS
         return (acc / n) ** 0.5
 
     async def send_clear(self):
@@ -414,12 +420,49 @@ class CallSession:
                     # ---------- VAD для barge-in по μ-law байтам ----------
                     if self.tts.is_active():
                         energy = self._vad_energy_mu_law(audio_bytes)
-                        if energy > SPEECH_ENERGY_THRESHOLD:
-                            logger.info(
-                                "VAD speech detected (energy=%.2f) during TTS -> barge-in",
-                                energy,
+
+                        # Инициализируем baseline первым значением,
+                        # дальше делаем скользящее среднее (очень "ленивое")
+                        if self.vad_noise_level is None:
+                            self.vad_noise_level = energy
+                        else:
+                            alpha = 0.98  # чем ближе к 1.0, тем медленнее адаптация
+                            self.vad_noise_level = (
+                                alpha * self.vad_noise_level
+                                + (1.0 - alpha) * energy
                             )
-                            await self.barge_in(reason=f"VAD energy={energy:.2f}")
+
+                        # Порог = baseline + запас
+                        threshold = self.vad_noise_level + VAD_MARGIN
+
+                        # иногда можно логировать для калибровки
+                        # logger.info(
+                        #     "VAD baseline=%.2f energy=%.2f threshold=%.2f",
+                        #     self.vad_noise_level, energy, threshold
+                        # )
+
+                        if energy > threshold:
+                            self.vad_over_thr_count += 1
+                        else:
+                            self.vad_over_thr_count = 0
+
+                        # Требуем несколько подряд "громких" кадров
+                        if self.vad_over_thr_count >= VAD_CONSEC_FRAMES:
+                            logger.info(
+                                "VAD speech detected (energy=%.2f, baseline=%.2f) "
+                                "during TTS -> barge-in",
+                                energy,
+                                self.vad_noise_level,
+                            )
+                            await self.barge_in(
+                                reason=(
+                                    f"VAD energy={energy:.2f}, "
+                                    f"baseline={self.vad_noise_level:.2f}"
+                                )
+                            )
+                            # после barge-in сбрасываем счётчик,
+                            # чтобы избежать постоянного спама
+                            self.vad_over_thr_count = 0
 
                     # ---------- Отправляем аудио в Soniox для STT ----------
                     try:
