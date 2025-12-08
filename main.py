@@ -132,7 +132,7 @@ class TtsSession:
         return self._active
 
     def cancel(self):
-        """Запрос на остановку текущего TTS-стрима (для barge-in)."""
+        """Запросить остановку текущего TTS-стрима (для barge-in)."""
         if self._active:
             logger.info("TTS cancel requested")
         self._cancel_event.set()
@@ -151,10 +151,11 @@ class TtsSession:
         # сбрасываем cancel и помечаем, что сейчас говорим
         self._cancel_event.clear()
         self._active = True
+        logger.info("TTS start, text='%s'", text)
 
         def _run():
+            logger.info("TTS thread started")
             try:
-                # ulaw_8000 специально под Twilio :contentReference[oaicite:3]{index=3}
                 response = self.eleven_client.text_to_speech.stream(
                     voice_id=ELEVENLABS_VOICE_ID,
                     model_id=ELEVENLABS_MODEL_ID,
@@ -165,7 +166,6 @@ class TtsSession:
                         similarity_boost=0.0,
                         style=0.0,
                         use_speaker_boost=True,
-                        # скорость в допустимом диапазоне ~1.1 
                         speed=1.1,
                     ),
                 )
@@ -197,6 +197,7 @@ class TtsSession:
                 logger.exception("Error in ElevenLabs TTS streaming: %s", e)
             finally:
                 self._active = False
+                logger.info("TTS thread finished")
 
         # блокирующий TTS — в отдельном thread
         await asyncio.to_thread(_run)
@@ -240,12 +241,19 @@ class CallSession:
         except Exception as e:
             logger.exception("Error sending Twilio clear: %s", e)
 
-    async def barge_in(self):
+    async def barge_in(self, reason: str = ""):
         """Barge-in: пользователь перебивает — рубим TTS и чистим буфер Twilio."""
-        if self.tts.is_active():
-            logger.info("BARGE-IN detected: cancelling TTS and clearing Twilio audio")
-            self.tts.cancel()
-            await self.send_clear()
+        if not self.tts.is_active():
+            return
+        if reason:
+            logger.info("BARGE-IN (%s): cancelling TTS and clearing Twilio audio", reason)
+        else:
+            logger.info("BARGE-IN: cancelling TTS and clearing Twilio audio")
+
+        # остановить TTS-стрим ElevenLabs
+        self.tts.cancel()
+        # очистить буфер аудио в Twilio (media queue) 
+        await self.send_clear()
 
     async def generate_gpt_reply(self, user_text: str) -> str:
         if not openai_client:
@@ -319,33 +327,35 @@ class CallSession:
                 self._finished = True
             return
 
-        # лог партиалов
+        # лог партиалов (для понимания задержки)
         partial_text = "".join(t.get("text", "") for t in tokens)
         if partial_text.strip():
             logger.info("Soniox partial: %s", partial_text)
 
-        # обработка токенов (+ barge-in)
+        # перебираем токены
         for t in tokens:
             txt = t.get("text", "") or ""
-
-            # <end> — конец высказывания пользователя :contentReference[oaicite:5]{index=5}
-            if txt == "<end>":
-                final = self.user_utterance.strip()
-                if final:
-                    # не блокируем цикл Soniox
-                    asyncio.create_task(self.handle_user_utterance(final))
-                self.user_utterance = ""
-                self.awaiting_new_utterance = True
+            if not txt:
                 continue
 
-            # начало НОВОЙ реплики пользователя после <end>
-            if self.awaiting_new_utterance and txt.strip():
-                # если ассистент сейчас говорит — бардж-ин
-                if self.tts.is_active():
-                    await self.barge_in()
-                self.awaiting_new_utterance = False
+            # --- BARGE-IN: как только видим живой текст во время TTS ---
+            if txt.strip() and self.tts.is_active():
+                # здесь можно указать reason, чтобы в логах было видно, по какому токену сработало
+                await self.barge_in(reason=f"token='{txt}'")
+                # после этого TTS перестанет слать аудио, а Twilio очистит буфер
+                # продолжаем обрабатывать текст как обычно (накапливаем фразу)
 
-            # накапливаем только финальные токены
+            # --- ENDPOINT DETECTION ---
+            if txt == "<end>":
+                final = self.user_utterance.strip()
+                logger.info("Soniox END token received, final user text: '%s'", final)
+                if final:
+                    asyncio.create_task(self.handle_user_utterance(final))
+                self.user_utterance = ""
+                # флаг отдельный больше не нужен, всё держим на user_utterance
+                continue
+
+            # --- накапливаем только финальные токены в текущую реплику пользователя ---
             if t.get("is_final"):
                 self.user_utterance += txt
 
