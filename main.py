@@ -45,7 +45,7 @@ SYSTEM_PROMPT = (
 )
 
 GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
-SPEECH_ENERGY_THRESHOLD = 18.0  # стартовый порог, будем смотреть по логам
+SPEECH_ENERGY_THRESHOLD = 30.0  # стартовый порог, будем смотреть по логам
 
 # ============================
 #   STT: Soniox
