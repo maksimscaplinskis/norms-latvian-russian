@@ -48,7 +48,7 @@ GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
 
 # VAD-параметры
 VAD_MARGIN = 35.0          # запас над базовым уровнем шума
-VAD_CONSEC_FRAMES = 3      # сколько подряд кадров > порога для barge-in
+VAD_CONSEC_FRAMES = 2      # сколько подряд кадров > порога для barge-in
 
 # ============================
 #   STT: Soniox
