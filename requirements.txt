@@ -5,3 +5,4 @@ openai
 elevenlabs
 websockets
 httpx
+python-multipart
