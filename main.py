@@ -44,6 +44,8 @@ SYSTEM_PROMPT = (
     "4) После подтверждения времени кратко поблагодари и заверши разговор."
 )
 
+GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
+
 # ============================
 #   STT: Soniox
 # ============================
@@ -223,9 +225,9 @@ class CallSession:
             }
         ]
         self.user_utterance = ""
-        self.awaiting_new_utterance = True
         self.llm_lock = asyncio.Lock()
         self._finished = False
+        self._greeting_sent = False
 
     async def send_clear(self):
         """Отправляем в Twilio 'clear' для бардж-ина."""
@@ -376,6 +378,11 @@ class CallSession:
                     self.tts.set_stream_sid(self.stream_sid)
                     logger.info("Twilio stream START: %s", self.stream_sid)
 
+                    # Сразу после старта стрима — приветствие ElevenLabs
+                    if not self._greeting_sent:
+                        self._greeting_sent = True
+                        asyncio.create_task(self.send_greeting())
+
                 elif event == "media":
                     media = data.get("media", {})
                     payload_b64 = media.get("payload")
@@ -429,6 +436,25 @@ class CallSession:
             except Exception:
                 pass
 
+    async def send_greeting(self):
+        """
+        Первое приветствие через ElevenLabs.
+        Сразу кладём его в контекст LLM как ответ ассистента.
+        Приветствие тоже можно перебить, потому что идёт через общий TTS.
+        """
+        text = GREETING_TEXT.strip()
+        if not text:
+            return
+
+        logger.info("Sending initial greeting TTS: %s", text)
+
+        # Записываем приветствие как первую реплику ассистента,
+        # чтобы модель знала, что мы уже поздоровались.
+        self.messages.append({"role": "assistant", "content": text})
+
+        # Произносим через тот же TTS-пайплайн (barge-in уже работает)
+        await self.tts.speak(text)
+
 
 # ============================
 #   HTTP endpoints
@@ -452,14 +478,11 @@ async def twilio_voice(
 
     # Простая приветственная фраза до подключения стрима
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="ru-RU" voice="woman">
-        Соединение установлено. Говорите, я вас слушаю.
-    </Say>
-    <Connect>
-        <Stream url="wss://{host}/twilio-stream" />
-    </Connect>
-</Response>"""
+    <Response>
+        <Connect>
+            <Stream url="wss://{host}/twilio-stream" />
+        </Connect>
+    </Response>"""
 
     return Response(content=twiml.strip(), media_type="text/xml")
 
