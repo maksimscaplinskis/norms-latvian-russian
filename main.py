@@ -3,24 +3,53 @@ import json
 import base64
 import logging
 import time
+import audioop
 import asyncio
-import websockets
-from urllib.parse import urlencode
-from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 import httpx
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 from elevenlabs.client import ElevenLabs
-from elevenlabs import VoiceSettings, RealtimeEvents
-import elevenlabs  # для Scribe Realtime
+from elevenlabs import VoiceSettings
+
 from starlette.websockets import WebSocketState
+
+import azure.cognitiveservices.speech as speechsdk
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio")
 
 app = FastAPI()
+
+# ====  Azure Speech общая конфигурация  ====
+SPEECH_KEY = os.getenv("SPEECH_KEY")
+SPEECH_REGION = os.getenv("SPEECH_REGION")
+
+if not SPEECH_KEY or not SPEECH_REGION:
+    logger.warning("SPEECH_KEY or SPEECH_REGION is not set!")
+
+speech_config = speechsdk.SpeechConfig(
+    subscription=SPEECH_KEY,
+    region=SPEECH_REGION,
+)
+
+# Сделать сегментацию более агрессивной (быстрее отдавать final)
+speech_config.set_property(
+    speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+    "500"  # 500 мс тишины после фразы – можно уменьшать/увеличивать
+)
+
+# Повысить чувствительность к началу речи
+speech_config.set_property(
+    speechsdk.PropertyId.Speech_StartEventSensitivity,
+    "high"
+)
+
+# Авто-определение RU / LV
+auto_detect_config = speechsdk.languageconfig.AutoDetectSourceLanguageConfig(
+    languages=["lv-LV", "ru-RU"]
+)
 
 # ====  OpenAI общая конфигурация  ====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -47,8 +76,8 @@ except Exception as e:
     eleven_client = None
 
 
-# Хранилище STT-сессий по streamSid (теперь Scribe v2 Realtime)
-stt_sessions: dict[str, "ScribeRealtimeSession"] = {}
+# Хранилище STT-сессий по streamSid
+stt_sessions: dict[str, "AzureSTTSession"] = {}
 
 # Хранилище LLM-сессий по streamSid
 llm_sessions: dict[str, "LLMConversation"] = {}
@@ -58,7 +87,6 @@ twilio_connections: dict[str, tuple[WebSocket, asyncio.AbstractEventLoop]] = {}
 
 # Мета-инфа по стримам: времена и т.п.
 stream_meta: dict[str, dict] = {}
-
 
 # ====  OpenAI LLM  ====
 class LLMConversation:
@@ -73,14 +101,12 @@ class LLMConversation:
 
         system_prompt = (
             "Tu esi auto servisa balss asistents. "
-            "Sākumā uzmanīgi noklausies klienta problēmu. "
-            "Pēc pirmajiem vārdiem nosaki, vai klients runā latviski vai krieviski, "
-            "un turpmāk runā tikai šajā valodā. "
-            "Runā īsiem, vienkāršiem teikumiem. "
-            "Kad saproti problēmu, piedāvā pierakstu uz auto pārbaudi "
-            "un palīdz izvēlēties dienu un laiku. "
-            "Kad pieraksts apstiprināts, pateicies un pieklājīgi nobeidz sarunu. "
-            "Nejautā klientam pārāk detalizētu tehnisko informāciju par viņa auto."
+            "Sākumā uzmanīgi noklausies klienta problēmu."
+            "Pēc pirmajiem vārdiem nosaki, vai klients runā latviski vai krieviski, un turpmāk runā tikai šajā valodā."
+            "Runā īsiem, vienkāršiem teikumiem."
+            "Kad saproti problēmu, piedāvā pierakstu uz auto pārbaudi un palīdz izvēlēties dienu un laiku."
+            "Kad pieraksts apstiprināts, pateicies un pieklājīgi nobeidz sarunu."
+            "Nejautat klientam detalizetu specifiku par vina auto"
         )
         self.messages.append({"role": "system", "content": system_prompt})
 
@@ -90,12 +116,11 @@ class LLMConversation:
         стримим токены в лог, возвращаем финальный текст ответа.
         """
 
-        # Можно при желании добавить инфу о языке в контекст
         # if lang_code:
         #     self.messages.append({
         #         "role": "system",
-        #         "content": f"Lietotājs runā valodā: {lang_code}. "
-        #                    f"Atbildi šajā pašā valodā."
+        #         "content": f"Пользователь говорит на языке: {lang_code}. "
+        #                    f"Отвечай на этом же языке."
         #     })
 
         self.messages.append({"role": "user", "content": text})
@@ -110,7 +135,7 @@ class LLMConversation:
                 stream=True,
                 max_completion_tokens=64,
                 temperature=0.4,
-                reasoning_effort="none",
+                reasoning_effort="none"
             )
 
             for chunk in stream:
@@ -130,183 +155,135 @@ class LLMConversation:
         return reply_text
 
 
-# ====  ElevenLabs Scribe v2 Realtime STT  ====
-class ScribeRealtimeSession:
+# ====  Azure STT  ====
+class AzureSTTSession:
     """
-    STT-сессия ElevenLabs Scribe v2 Realtime для одного Twilio streamSid.
-    Берём μ-law 8kHz от Twilio, конвертим в PCM 16kHz и шлём в WebSocket.
+    Одна STT-сессия Azure на один Twilio streamSid.
+    Принимает μ-law 8kHz байты, конвертирует их в 16kHz 16-bit PCM
+    и пишет в PushAudioInputStream.
     """
 
     def __init__(self, stream_sid: str, on_final_callback=None):
         self.stream_sid = stream_sid
+        self._rate_state = None
         self.on_final_callback = on_final_callback
 
-        self._rate_state = None
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        # БЕЗ формата -> дефолт: 16kHz, 16bit, mono PCM
+        self.push_stream = speechsdk.audio.PushAudioInputStream()
+        audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
 
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._send_task: asyncio.Task | None = None
-        self._recv_task: asyncio.Task | None = None
-        self._closed = False
+        self.recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config,
+            audio_config=audio_config,
+            auto_detect_source_language_config=auto_detect_config,
+        )
 
-    async def start(self):
-        """
-        Открываем WebSocket к Scribe v2 Realtime и запускаем send/recv циклы.
-        """
-        if not ELEVENLABS_API_KEY:
-            logger.error("[%s] ELEVENLABS_API_KEY is not set, cannot start Scribe", self.stream_sid)
-            return
+        # События
+        self.recognizer.recognizing.connect(self._on_recognizing)
+        self.recognizer.recognized.connect(self._on_recognized)
+        self.recognizer.canceled.connect(self._on_canceled)
+        self.recognizer.session_started.connect(
+            lambda evt: logger.info(f"[{self.stream_sid}] Azure STT session started")
+        )
+        self.recognizer.session_stopped.connect(
+            lambda evt: logger.info(f"[{self.stream_sid}] Azure STT session stopped")
+        )
 
-        params = {
-            "model_id": "scribe_v2_realtime",
-            "audio_format": "ulaw_8000",
-            "commit_strategy": "vad",
-            "vad_silence_threshold_secs": 0.5,
-            "vad_threshold": 0.4,
-            "min_speech_duration_ms": 100,
-            "min_silence_duration_ms": 150,
-            "include_timestamps": "false",
-        }
+        logger.info(f"[{self.stream_sid}] Creating Azure STT session")
 
-        ws_url = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?" + urlencode(params)
-        logger.info("[%s] Connecting Scribe Realtime with params=%s", self.stream_sid, params)
-
-        try:
-            self._ws = await websockets.connect(
-                ws_url,
-                additional_headers={"xi-api-key": ELEVENLABS_API_KEY},
-            )
-            logger.info("[%s] Scribe Realtime WebSocket connected", self.stream_sid)
-        except Exception as e:
-            logger.exception("[%s] Failed to connect to Scribe Realtime: %s", self.stream_sid, e)
-            return
-
-        self._send_task = asyncio.create_task(self._send_loop())
-        self._recv_task = asyncio.create_task(self._recv_loop())
+        self.recognizer.start_continuous_recognition()
 
     def push_audio(self, mulaw_bytes: bytes):
-        if not mulaw_bytes or self._closed:
+        """
+        Получает μ-law 8kHz байты от Twilio,
+        конвертирует в 16-bit PCM 16kHz и отправляет в Azure.
+        """
+        if not mulaw_bytes:
             return
-        try:
-            self._audio_queue.put_nowait(mulaw_bytes)
-        except asyncio.QueueFull:
-            logger.warning("[%s] Scribe audio queue full, dropping chunk", self.stream_sid)
+
+        # 1) μ-law (8bit) -> PCM 16bit, 8kHz
+        pcm16_8k = audioop.ulaw2lin(mulaw_bytes, 2)  # 2 байта на сэмпл
+
+        # 2) 8kHz -> 16kHz (ratecv поддерживает состояние между вызовами)
+        pcm16_16k, self._rate_state = audioop.ratecv(
+            pcm16_8k,
+            2,      # ширина сэмпла (байты)
+            1,      # каналов
+            8000,   # in_rate
+            16000,  # out_rate
+            self._rate_state,
+        )
+
+        # 3) Пишем в поток Azure
+        self.push_stream.write(pcm16_16k)
 
     def stop(self):
-        """
-        Синхронный стоп: ставим флаг, гасим задачи и закрываем WebSocket.
-        Вызывается из Twilio-хэндлера без await.
-        """
-        if self._closed:
+        try:
+            logger.info(f"[{self.stream_sid}] Stopping Azure STT session")
+            self.push_stream.close()
+            self.recognizer.stop_continuous_recognition()
+        except Exception as e:
+            logger.exception(f"[{self.stream_sid}] Error while stopping STT: {e}")
+
+    # ----- callbacks -----
+
+    def _on_recognizing(self, evt: speechsdk.SpeechRecognitionEventArgs):
+        result = evt.result
+        text = result.text
+        if not text:
             return
 
-        self._closed = True
+        lang = None
+        # пробуем достать определённый язык
+        props = result.properties
+        lang = props.get(
+            speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult
+        )
 
-        # разблокировать send_loop, если он ждёт .get()
-        try:
-            self._audio_queue.put_nowait(b"")  # теперь это просто "будилка"
-        except Exception:
-            pass
+        logger.info(
+            f"[{self.stream_sid}] Recognizing (partial) "
+            f"[lang={lang}]: {text}"
+        )
 
-        async def _cleanup():
-            if self._send_task:
-                self._send_task.cancel()
-            if self._recv_task:
-                self._recv_task.cancel()
-            if self._ws and not self._ws.closed:
+    def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs):
+        result = evt.result
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            text = result.text
+            props = result.properties
+            lang_raw = props.get(
+                speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult
+            )
+
+            logger.info(
+                f"[{self.stream_sid}] Recognized (final) [lang={lang_raw}]: {text!r}"
+            )
+
+            latency_ms = props.get(
+                speechsdk.PropertyId.SpeechServiceResponse_RecognitionLatencyMs
+            )
+
+            logger.info(
+                "[%s] Recognized (final) [lang=%s, latency=%sms]: %r",
+                self.stream_sid, lang_raw, latency_ms, text
+            )
+
+            # Вызовем колбэк (LLM)
+            if self.on_final_callback and text:
                 try:
-                    await self._ws.close()
-                except Exception:
-                    logger.exception("[%s] Error while closing Scribe WS", self.stream_sid)
-
-            logger.info("[%s] Scribe session stopped", self.stream_sid)
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_cleanup())
-        except RuntimeError:
-            pass
-
-        # Запускаем асинхронную очистку в текущем event loop
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_cleanup())
-        except RuntimeError:
-            # нет активного loop (на всякий случай) – игнорируем
-            pass
-
-    async def _send_loop(self):
-        assert self._ws is not None
-        try:
-            while True:
-                chunk = await self._audio_queue.get()
-
-                # если нас попросили остановиться — выходим
-                if self._closed:
-                    break
-
-                # пустые чанки просто игнорируем
-                if not chunk:
-                    continue
-
-                # если WS умер — тоже выходим
-                if self._ws.closed:
-                    break
-
-                audio_b64 = base64.b64encode(chunk).decode("ascii")
-                msg = {
-                    "message_type": "input_audio_chunk",
-                    "audio_base_64": audio_b64,
-                    "sample_rate": 8000,
-                }
-
-                try:
-                    await self._ws.send(json.dumps(msg))
+                    self.on_final_callback(self.stream_sid, text, lang_raw)
                 except Exception as e:
-                    logger.exception("[%s] Error sending audio to Scribe: %s", self.stream_sid, e)
-                    break
-        finally:
-            logger.info("[%s] Scribe send loop finished", self.stream_sid)
+                    logger.exception(
+                        f"[{self.stream_sid}] Error in on_final_callback: {e}"
+                    )
 
-    async def _recv_loop(self):
-        assert self._ws is not None
-        try:
-            async for raw in self._ws:
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    logger.warning("[%s] Non-JSON message from Scribe: %r", self.stream_sid, raw)
-                    continue
+        elif result.reason == speechsdk.ResultReason.NoMatch:
+            logger.info(f"[{self.stream_sid}] NoMatch: {result.no_match_details}")
 
-                mtype = data.get("message_type")
-                text = data.get("text") or ""
-                lang_code = data.get("language_code")  # может и не быть
-
-                if mtype == "session_started":
-                    logger.info("[%s] Scribe session_started: %s", self.stream_sid, data)
-                elif mtype == "partial_transcript":
-                    if text:
-                        logger.info("[%s] Scribe partial: %r", self.stream_sid, text)
-                elif mtype in ("committed_transcript", "committed_transcript_with_timestamps"):
-                    logger.info("[%s] Scribe committed: %r (lang=%s)", self.stream_sid, text, lang_code)
-                    if self.on_final_callback and text:
-                        try:
-                            # handle_final_transcript(stream_sid, text, lang_raw)
-                            self.on_final_callback(self.stream_sid, text, lang_code)
-                        except Exception:
-                            logger.exception("[%s] Error in on_final_callback", self.stream_sid)
-                elif mtype and mtype.endswith("_error"):
-                    logger.error("[%s] Scribe error event: %s", self.stream_sid, data)
-                else:
-                    logger.debug("[%s] Scribe event %s: %s", self.stream_sid, mtype, data)
-
-        except (ConnectionClosedOK, ConnectionClosedError):
-            logger.info("[%s] Scribe websocket closed", self.stream_sid)
-        except Exception as e:
-            logger.exception("[%s] Scribe recv loop error: %s", self.stream_sid, e)
-        finally:
-            self._closed = True
-            logger.info("[%s] Scribe recv loop finished", self.stream_sid)
+    def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs):
+        logger.warning(
+            f"[{self.stream_sid}] CANCELED: reason={evt.reason}, "
+            f"error_details={evt.error_details}"
+        )
 
 
 # ====  Twilio Media Stream: WebSocket с аудио  ====
@@ -315,8 +292,9 @@ async def twilio_stream(ws: WebSocket):
     await ws.accept()
     logger.info("Twilio WS connected")
 
-    stream_sid: str | None = None
+    stream_sid = None
     loop = asyncio.get_running_loop()
+
     first_media_ts = None
 
     try:
@@ -340,21 +318,18 @@ async def twilio_stream(ws: WebSocket):
 
                 twilio_connections[stream_sid] = (ws, loop)
 
-                # создаём Scribe STT-сессию под этот streamSid
+                # создаём STT сессию под этот streamSid
                 if stream_sid in stt_sessions:
                     logger.warning(
                         f"STT session for {stream_sid} already exists, overwriting"
                     )
-
-                session = ScribeRealtimeSession(
+                stt_sessions[stream_sid] = AzureSTTSession(
                     stream_sid,
                     on_final_callback=handle_final_transcript,
                 )
-                asyncio.create_task(session.start())
-                stt_sessions[stream_sid] = session
 
-                # приветствие (TTS → Twilio)
                 asyncio.create_task(send_initial_greeting(ws, stream_sid))
+                # -----------------------------------------------
 
             elif event == "media":
                 if first_media_ts is None:
@@ -371,7 +346,6 @@ async def twilio_stream(ws: WebSocket):
 
                 session = stt_sessions.get(stream_sid)
                 if session:
-                    # отправляем аудио в Scribe
                     session.push_audio(mulaw_bytes)
 
             elif event == "stop":
@@ -380,9 +354,11 @@ async def twilio_stream(ws: WebSocket):
                     stt_sessions[stream_sid].stop()
                     del stt_sessions[stream_sid]
 
+                # чистим Twilio WebSocket для этого streamSid
                 if stream_sid and stream_sid in twilio_connections:
                     del twilio_connections[stream_sid]
-
+                    
+                # чистим мету
                 if stream_sid and stream_sid in stream_meta:
                     del stream_meta[stream_sid]
 
@@ -396,6 +372,7 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         logger.exception(f"Error in twilio_stream: {e}")
     finally:
+        # на всякий случай чистим сессию, если осталась
         if stream_sid and stream_sid in stt_sessions:
             stt_sessions[stream_sid].stop()
             del stt_sessions[stream_sid]
@@ -427,27 +404,26 @@ async def voice_webhook(request: Request):
             </Stream>
         </Connect>
     </Response>"""
-
+    
     # Важно: отдать как XML
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 
 def handle_final_transcript(stream_sid: str, text: str, lang_raw: str | None):
     """
-    Вызывается, когда Scribe STT отдала финальный текст (committed transcript).
+    Вызывается, когда Azure STT распознал финальный текст.
     Создаёт/берёт LLMConversation и отправляет туда фразу.
-    Потом запускает TTS → Twilio.
+    Пока что только логируем ответ LLM.
     """
-    # Попробуем вытащить код языка, если lang_raw — JSON (в Azure так было),
-    # для Scribe чаще всего это уже строка кода языка или None.
+    # Попробуем вытащить код языка из JSON строки Azure
     lang_code = None
     if lang_raw:
         try:
             obj = json.loads(lang_raw)
+            # Azure иногда использует "language" или "Language"
             lang_code = obj.get("language") or obj.get("Language")
         except Exception:
-            # если это уже строка (например "lv", "ru") или вообще что-то другое
-            lang_code = str(lang_raw)
+            lang_code = lang_raw  # ну хоть что-то
 
     logger.info(
         f"[{stream_sid}] Final transcript for LLM "
@@ -460,7 +436,8 @@ def handle_final_transcript(stream_sid: str, text: str, lang_raw: str | None):
 
     conv = llm_sessions[stream_sid]
 
-    # синхронный вызов OpenAI (как и раньше)
+    # ⚠️ Внимание: это синхронный вызов, но он идёт из потока Azure STT,
+    # не блокируя обработку Twilio WebSocket.
     reply_text = conv.handle_user_utterance(text, lang_code=lang_code)
 
     if reply_text:
@@ -504,7 +481,7 @@ def stream_tts_to_twilio(stream_sid: str, text: str):
             output_format="ulaw_8000",
             voice_settings=VoiceSettings(
                 stability=0.5,
-                similarity_boost=0.0,  # тут была опечатка similarity_byle
+                similarity_byle=0.0,
                 use_speaker_boost=True,
                 speed=1.3,
             ),
@@ -570,7 +547,6 @@ async def send_initial_greeting(ws: WebSocket, stream_sid: str):
     logger.info(f"[{stream_sid}] GREETING TTS: starting greeting")
     await eleven_stream_tts_to_twilio(ws, stream_sid, greeting_text, prefix="GREETING TTS")
 
-
 async def eleven_stream_tts_to_twilio(
     ws: WebSocket,
     stream_sid: str,
@@ -582,7 +558,7 @@ async def eleven_stream_tts_to_twilio(
     Используем U-Law 8kHz, чтобы не перекодировать.
     """
     if not ELEVENLABS_API_KEY:
-        logger.error("ELEVENLABS_API_KEY is not set")
+        logger.error("ELEVEN_API_KEY is not set")
         return
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
@@ -598,7 +574,7 @@ async def eleven_stream_tts_to_twilio(
         "model_id": ELEVENLABS_MODEL_ID,  # ⚠ ОБЯЗАТЕЛЬНО
         # "voice_settings": {
         #     "stability": 0.5,
-        #     "similarity_boost": 0.0,
+        #     "similarity_byle": 0.0,
         #     "use_speaker_boost": True,
         # },
     }
@@ -635,6 +611,12 @@ async def eleven_stream_tts_to_twilio(
                     )
                     break
 
+                if not first_chunk_sent:
+                    logger.info(
+                        f"[{stream_sid}] {prefix}: first audio chunk ready to send to Twilio"
+                    )
+                    first_chunk_sent = True
+
                 msg = {
                     "event": "media",
                     "streamSid": stream_sid,
@@ -642,14 +624,4 @@ async def eleven_stream_tts_to_twilio(
                         "payload": base64.b64encode(chunk).decode("ascii"),
                     },
                 }
-
-                try:
-                    await ws.send_text(json.dumps(msg))
-                except RuntimeError as e:
-                    logger.warning(
-                        f"[{stream_sid}] {prefix}: failed to send chunk (WS closed): {e}"
-                    )
-                    break
-                except Exception:
-                    logger.exception(f"[{stream_sid}] {prefix}: unexpected error while sending chunk")
-                    break
+                await ws.send_text(json.dumps(msg))
