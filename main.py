@@ -4,6 +4,7 @@ import base64
 import logging
 import asyncio
 import threading
+import audioop
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
@@ -45,6 +46,7 @@ SYSTEM_PROMPT = (
 )
 
 GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
+SPEECH_RMS_THRESHOLD = 800
 
 # ============================
 #   STT: Soniox
@@ -285,7 +287,7 @@ class CallSession:
                         continue
                     piece = token if isinstance(token, str) else str(token)
                     assistant_text += piece
-                    logger.info("GPT partial: %s", assistant_text)
+                    # logger.info("GPT partial: %s", assistant_text)
             except Exception as e:
                 logger.exception("Error in GPT stream: %s", e)
             return assistant_text.strip()
@@ -388,7 +390,24 @@ class CallSession:
                     payload_b64 = media.get("payload")
                     if not payload_b64:
                         continue
+
                     audio_bytes = base64.b64decode(payload_b64)
+
+                    # ---------- VAD для barge-in (по “сырым” данным) ----------
+                    # μ-law -> линейный PCM 16 bit
+                    try:
+                        lin16 = audioop.ulaw2lin(audio_bytes, 2)
+                        rms = audioop.rms(lin16, 2)
+                    except Exception as e:
+                        logger.warning("VAD error (audioop): %s", e)
+                        rms = 0
+
+                    # Если ассистент говорит и RMS выше порога — считаем, что клиент перебил
+                    if self.tts.is_active() and rms > SPEECH_RMS_THRESHOLD:
+                        logger.info("VAD speech detected (rms=%d) during TTS -> barge-in", rms)
+                        await self.barge_in(reason=f"VAD rms={rms}")
+
+                    # ---------- Отправляем аудио в Soniox для распознавания ----------
                     try:
                         await self.stt.send_audio(audio_bytes)
                     except Exception as e:
