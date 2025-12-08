@@ -3,6 +3,7 @@ import json
 import base64
 import logging
 import asyncio
+import threading
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
@@ -13,12 +14,10 @@ from openai import OpenAI
 from elevenlabs.client import ElevenLabs
 from elevenlabs import VoiceSettings
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("twilio-soniox-openai-eleven")
-
 app = FastAPI()
 
-# === ENV / clients ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("twilio-soniox-openai-eleven")
 
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -30,107 +29,231 @@ ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post("/twilio/voice")
-async def twilio_voice(
-    request: Request,
-    CallSid: str = Form(None),
-    From: str = Form(None),
-    To: str = Form(None),
-):
-    logger.info(f"Incoming call: CallSid={CallSid}, From={From}, To={To}")
-
-    host = request.url.hostname
-
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="ru-RU" voice="woman">
-        Соединение установлено. Говорите, я вас слушаю.
-    </Say>
-    <Connect>
-        <Stream url="wss://{host}/twilio-stream" />
-    </Connect>
-</Response>"""
-
-    return Response(content=twiml.strip(), media_type="text/xml")
+# Максимально простой промпт под автосервис
+SYSTEM_PROMPT = (
+    "Ты голосовой ассистент автосервиса. "
+    "Определи, говорит ли клиент по-русски или по-латышски, "
+    "и отвечай только на этом языке. "
+    "Говори очень короткими фразами (1–2 предложения). "
+    "Не начинай ответ с приветствия. "
+    "Твои задачи: "
+    "1) Понять проблему с машиной. Если клиент уже описал проблему, не переспрашивай её ещё раз. "
+    "2) Понять, хочет ли клиент записаться на осмотр. Если клиент сам говорит, что хочет записаться, сразу переходи к записи. "
+    "3) Если клиент хочет записаться, предложи один конкретный вариант времени (дату и время) и спроси, подходит ли он. "
+    "4) После подтверждения времени кратко поблагодари и заверши разговор."
+)
 
 
-@app.websocket("/twilio-stream")
-async def twilio_stream(ws: WebSocket):
-    await ws.accept()
-    logger.info("Twilio WebSocket connected")
+# ============================
+#   STT: Soniox
+# ============================
 
-    if not SONIOX_API_KEY:
-        logger.error("SONIOX_API_KEY is not set")
-        await ws.close()
-        return
+class SttSession:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.ws: websockets.WebSocketClientProtocol | None = None
 
-    loop = asyncio.get_running_loop()
-    talk_lock = asyncio.Lock()          # чтобы не было двух голосовых ответов одновременно
-    stream_sid_holder = {"sid": None}   # сюда положим streamSid от Twilio
+    async def connect(self):
+        if not self.api_key:
+            raise RuntimeError("SONIOX_API_KEY is not set")
 
-    # Простейший промпт ассистента (можем потом заменить на твой кастомный)
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты голосовой ассистент автосервиса. "
-                "Отвечай коротко, по делу, без приветствий в начале ответа. "
-                "Определи язык пользователя (русский или латышский) по его словам "
-                "и отвечай на том же языке."
-            ),
-        }
-    ]
-
-    # === подключение к Soniox ===
-    try:
-        soniox_ws = await websockets.connect("wss://stt-rt.soniox.com/transcribe-websocket")
+        # WebSocket Soniox
+        self.ws = await websockets.connect("wss://stt-rt.soniox.com/transcribe-websocket")
         logger.info("Connected to Soniox WebSocket")
-    except Exception as e:
-        logger.exception(f"Cannot connect to Soniox: {e}")
-        await ws.close()
-        return
 
-    config_msg = {
-        "api_key": SONIOX_API_KEY,
-        "model": "stt-rt-preview",
-        "audio_format": "mulaw",
-        "sample_rate": 8000,
-        "num_channels": 1,
-        "enable_language_identification": True,
-        "language_hints": ["ru", "lv"],
-        "enable_endpoint_detection": True,
-        "client_reference_id": "twilio-call",
-    }
-
-    try:
-        await soniox_ws.send(json.dumps(config_msg))
+        # Конфиг для телефонного zvana (mulaw 8kHz, endpoint detection + LID) :contentReference[oaicite:2]{index=2}
+        config_msg = {
+            "api_key": self.api_key,
+            "model": "stt-rt-preview",
+            "audio_format": "mulaw",
+            "sample_rate": 8000,
+            "num_channels": 1,
+            "enable_language_identification": True,
+            "language_hints": ["ru", "lv"],
+            "enable_endpoint_detection": True,
+            "client_reference_id": "twilio-call",
+        }
+        await self.ws.send(json.dumps(config_msg))
         logger.info("Sent Soniox config")
-    except Exception as e:
-        logger.exception(f"Failed to send Soniox config: {e}")
-        await soniox_ws.close()
-        await ws.close()
-        return
 
-    # === GPT ===
+    async def send_audio(self, audio_bytes: bytes):
+        if self.ws:
+            await self.ws.send(audio_bytes)
 
-    async def generate_gpt_reply(user_text: str) -> str:
-        """
-        Вызываем OpenAI Chat Completions c stream=True в отдельном потоке.
-        Возвращаем финальный текст ответа.
-        """
+    async def finalize(self):
+        """Сообщаем Soniox, что аудио больше не будет."""
+        if self.ws:
+            try:
+                await self.ws.send(b"")
+            except Exception:
+                pass
+
+    async def receive_loop(self, handler):
+        """Читаем все сообщения от Soniox и передаём в handler."""
+        if not self.ws:
+            return
+        try:
+            async for message in self.ws:
+                try:
+                    resp = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.warning("Non-JSON Soniox message: %r", message)
+                    continue
+                await handler(resp)
+        except Exception as e:
+            logger.exception("Error in SttSession.receive_loop: %s", e)
+
+    async def close(self):
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+
+# ============================
+#   TTS: ElevenLabs -> Twilio
+# ============================
+
+class TtsSession:
+    def __init__(self, eleven_client: ElevenLabs | None, ws: WebSocket, loop: asyncio.AbstractEventLoop):
+        self.eleven_client = eleven_client
+        self.ws = ws
+        self.loop = loop
+        self.stream_sid: str | None = None
+        self._cancel_event = threading.Event()
+        self._active = False
+
+    def set_stream_sid(self, sid: str | None):
+        self.stream_sid = sid
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def cancel(self):
+        """Запрос на остановку текущего TTS-стрима (для barge-in)."""
+        if self._active:
+            logger.info("TTS cancel requested")
+        self._cancel_event.set()
+
+    async def speak(self, text: str):
+        """Стрим ElevenLabs TTS обратно в Twilio через media-сообщения."""
+        if not self.eleven_client:
+            logger.warning("ELEVENLABS_API_KEY is not set, skip TTS")
+            return
+        if not self.stream_sid:
+            logger.warning("streamSid is not set, skip TTS")
+            return
+        if not text.strip():
+            return
+
+        # сбрасываем cancel и помечаем, что сейчас говорим
+        self._cancel_event.clear()
+        self._active = True
+
+        def _run():
+            try:
+                # ulaw_8000 специально под Twilio :contentReference[oaicite:3]{index=3}
+                response = self.eleven_client.text_to_speech.stream(
+                    voice_id=ELEVENLABS_VOICE_ID,
+                    model_id=ELEVENLABS_MODEL_ID,
+                    text=text,
+                    output_format="ulaw_8000",
+                    voice_settings=VoiceSettings(
+                        stability=0.5,
+                        similarity_boost=0.0,
+                        style=0.0,
+                        use_speaker_boost=True,
+                        # скорость в допустимом диапазоне ~1.1 
+                        speed=1.1,
+                    ),
+                )
+                for chunk in response:
+                    if self._cancel_event.is_set():
+                        logger.info("TTS streaming cancelled mid-stream")
+                        break
+                    if not chunk:
+                        continue
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        continue
+
+                    payload = base64.b64encode(chunk).decode("ascii")
+                    msg = {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": payload},
+                    }
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self.ws.send_text(json.dumps(msg)),
+                        self.loop,
+                    )
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        logger.exception("Error sending audio to Twilio: %s", e)
+                        break
+            except Exception as e:
+                logger.exception("Error in ElevenLabs TTS streaming: %s", e)
+            finally:
+                self._active = False
+
+        # блокирующий TTS — в отдельном thread
+        await asyncio.to_thread(_run)
+
+
+# ============================
+#   CallSession: Twilio + логика
+# ============================
+
+class CallSession:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.loop = asyncio.get_running_loop()
+        self.stream_sid: str | None = None
+        self.stt = SttSession(SONIOX_API_KEY)
+        self.tts = TtsSession(eleven_client, ws, self.loop)
+
+        # контекст для GPT
+        self.messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            }
+        ]
+        self.user_utterance = ""
+        self.awaiting_new_utterance = True
+        self.llm_lock = asyncio.Lock()
+        self._finished = False
+
+    async def send_clear(self):
+        """Отправляем в Twilio 'clear' для бардж-ина."""
+        if not self.stream_sid:
+            return
+        msg = {
+            "event": "clear",
+            "streamSid": self.stream_sid,
+        }
+        try:
+            await self.ws.send_text(json.dumps(msg))
+            logger.info("Sent Twilio clear for streamSid=%s", self.stream_sid)
+        except Exception as e:
+            logger.exception("Error sending Twilio clear: %s", e)
+
+    async def barge_in(self):
+        """Barge-in: пользователь перебивает — рубим TTS и чистим буфер Twilio."""
+        if self.tts.is_active():
+            logger.info("BARGE-IN detected: cancelling TTS and clearing Twilio audio")
+            self.tts.cancel()
+            await self.send_clear()
+
+    async def generate_gpt_reply(self, user_text: str) -> str:
         if not openai_client:
             logger.warning("OPENAI_API_KEY is not set, skip GPT call")
             return ""
 
-        # Добавляем реплику пользователя в историю диалога
-        messages.append({"role": "user", "content": user_text})
-        messages_for_call = list(messages)  # копия для отдельного потока
+        self.messages.append({"role": "user", "content": user_text})
+        messages_for_call = list(self.messages)
 
         def _run_sync(msgs):
             assistant_text = ""
@@ -150,113 +273,87 @@ async def twilio_stream(ws: WebSocket):
                     token = getattr(delta, "content", None)
                     if not token:
                         continue
-                    # В большинстве случаев content — это строка
                     piece = token if isinstance(token, str) else str(token)
                     assistant_text += piece
                     logger.info("GPT partial: %s", assistant_text)
             except Exception as e:
-                logger.exception(f"Error in GPT stream: {e}")
+                logger.exception("Error in GPT stream: %s", e)
             return assistant_text.strip()
 
         assistant_text = await asyncio.to_thread(_run_sync, messages_for_call)
-
         if assistant_text:
-            messages.append({"role": "assistant", "content": assistant_text})
-
+            self.messages.append({"role": "assistant", "content": assistant_text})
         return assistant_text
 
-    # === ElevenLabs TTS ===
-
-    async def speak_with_elevenlabs(text: str):
-        """
-        Вызываем ElevenLabs TTS stream(output_format=ulaw_8000) и в реальном времени
-        отсылаем чанки аудио обратно в Twilio как media-сообщения.
-        """
-        if not eleven_client:
-            logger.warning("ELEVENLABS_API_KEY is not set, skip TTS")
-            return
-        if not ELEVENLABS_VOICE_ID:
-            logger.warning("ELEVENLABS_VOICE_ID is not set, skip TTS")
-            return
-        if not text.strip():
+    async def handle_user_utterance(self, text: str):
+        """Soniox дал <end> — закончили фразу пользователя."""
+        text = text.strip()
+        if not text:
             return
 
-        sid = stream_sid_holder["sid"]
-        if not sid:
-            logger.warning("streamSid is not yet known, cannot send audio")
-            return
-
-        def _tts_and_stream():
-            try:
-                response = eleven_client.text_to_speech.stream(
-                    voice_id=ELEVENLABS_VOICE_ID,
-                    model_id=ELEVENLABS_MODEL_ID,
-                    text=text,
-                    output_format="ulaw_8000",  # μ-law 8kHz — формат Twilio
-                    voice_settings=VoiceSettings(
-                        stability=0.5,
-                        similarity_boost=0.0,
-                        style=0.0,
-                        use_speaker_boost=True,
-                        speed=1.3,
-                    ),
-                )
-                for chunk in response:
-                    if not chunk:
-                        continue
-                    if not isinstance(chunk, (bytes, bytearray)):
-                        continue
-
-                    payload = base64.b64encode(chunk).decode("ascii")
-                    msg = {
-                        "event": "media",
-                        "streamSid": sid,
-                        "media": {"payload": payload},
-                    }
-                    fut = asyncio.run_coroutine_threadsafe(
-                        ws.send_text(json.dumps(msg)),
-                        loop,
-                    )
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        logger.exception(f"Error sending audio to Twilio: {e}")
-                        break
-            except Exception as e:
-                logger.exception(f"Error in ElevenLabs TTS streaming: {e}")
-
-        await asyncio.to_thread(_tts_and_stream)
-
-    # === обработка финальных фраз от пользователя ===
-
-    async def handle_user_utterance(text: str):
-        """
-        Получили финальную фразу от Soniox (по <end>) — вызываем GPT и затем TTS.
-        Используем lock, чтобы не говорить два ответа одновременно.
-        """
-        if not text.strip():
-            return
-
-        if talk_lock.locked():
-            logger.info("Assistant is already speaking, skip utterance: %s", text)
-            return
-
-        async with talk_lock:
+        async with self.llm_lock:
             logger.info("User utterance (final): %s", text)
-            reply = await generate_gpt_reply(text)
+            reply = await self.generate_gpt_reply(text)
             if reply:
                 logger.info("GPT final reply: %s", reply)
-                await speak_with_elevenlabs(reply)
+                await self.tts.speak(reply)
 
-    # === корутины для Twilio <-> Soniox ===
+    async def handle_stt_response(self, resp: dict):
+        # ошибки Soniox
+        if resp.get("error_code"):
+            logger.error(
+                "Soniox error %s: %s",
+                resp.get("error_code"),
+                resp.get("error_message"),
+            )
+            return
 
-    async def twilio_to_soniox():
-        """
-        Читаем события от Twilio и отправляем аудио в Soniox.
-        """
+        tokens = resp.get("tokens", [])
+        if not tokens:
+            if resp.get("finished"):
+                logger.info(
+                    "Soniox finished: final_audio_proc_ms=%s total_audio_proc_ms=%s",
+                    resp.get("final_audio_proc_ms"),
+                    resp.get("total_audio_proc_ms"),
+                )
+                self._finished = True
+            return
+
+        # лог партиалов
+        partial_text = "".join(t.get("text", "") for t in tokens)
+        if partial_text.strip():
+            logger.info("Soniox partial: %s", partial_text)
+
+        # обработка токенов (+ barge-in)
+        for t in tokens:
+            txt = t.get("text", "") or ""
+
+            # <end> — конец высказывания пользователя :contentReference[oaicite:5]{index=5}
+            if txt == "<end>":
+                final = self.user_utterance.strip()
+                if final:
+                    # не блокируем цикл Soniox
+                    asyncio.create_task(self.handle_user_utterance(final))
+                self.user_utterance = ""
+                self.awaiting_new_utterance = True
+                continue
+
+            # начало НОВОЙ реплики пользователя после <end>
+            if self.awaiting_new_utterance and txt.strip():
+                # если ассистент сейчас говорит — бардж-ин
+                if self.tts.is_active():
+                    await self.barge_in()
+                self.awaiting_new_utterance = False
+
+            # накапливаем только финальные токены
+            if t.get("is_final"):
+                self.user_utterance += txt
+
+    async def twilio_loop(self):
+        """Читаем события Twilio и шлём аудио в Soniox."""
         try:
             while True:
-                msg = await ws.receive_text()
+                msg = await self.ws.receive_text()
                 data = json.loads(msg)
                 event = data.get("event")
 
@@ -265,9 +362,9 @@ async def twilio_stream(ws: WebSocket):
 
                 elif event == "start":
                     start = data.get("start", {})
-                    stream_sid = start.get("streamSid")
-                    stream_sid_holder["sid"] = stream_sid
-                    logger.info(f"Twilio stream START: {stream_sid}")
+                    self.stream_sid = start.get("streamSid")
+                    self.tts.set_stream_sid(self.stream_sid)
+                    logger.info("Twilio stream START: %s", self.stream_sid)
 
                 elif event == "media":
                     media = data.get("media", {})
@@ -276,103 +373,91 @@ async def twilio_stream(ws: WebSocket):
                         continue
                     audio_bytes = base64.b64decode(payload_b64)
                     try:
-                        await soniox_ws.send(audio_bytes)
+                        await self.stt.send_audio(audio_bytes)
                     except Exception as e:
-                        logger.exception(f"Error sending audio to Soniox: {e}")
+                        logger.exception("Error sending audio to Soniox: %s", e)
                         break
 
                 elif event == "stop":
                     logger.info("Twilio stream STOP received")
-                    try:
-                        await soniox_ws.send(b"")
-                    except Exception:
-                        pass
+                    await self.stt.finalize()
                     break
 
                 else:
-                    logger.debug(f"Unhandled Twilio event: {event}")
+                    logger.debug("Unhandled Twilio event: %s", event)
 
         except WebSocketDisconnect:
             logger.info("Twilio WebSocket disconnected")
+            await self.stt.finalize()
+        except Exception as e:
+            logger.exception("Error in twilio_loop: %s", e)
+            await self.stt.finalize()
+
+    async def stt_loop(self):
+        """Цикл чтения результатов Soniox."""
+        await self.stt.receive_loop(self.handle_stt_response)
+        self._finished = True
+
+    async def run(self):
+        """Запускаем STT и Twilio петли параллельно."""
+        try:
+            await self.stt.connect()
+        except Exception as e:
+            logger.exception("Cannot start SttSession: %s", e)
+            await self.ws.close()
+            return
+
+        try:
+            await asyncio.gather(
+                self.twilio_loop(),
+                self.stt_loop(),
+            )
+        finally:
+            await self.stt.close()
             try:
-                await soniox_ws.send(b"")
+                await self.ws.close()
             except Exception:
                 pass
-        except Exception as e:
-            logger.exception(f"Error in twilio_to_soniox: {e}")
-            try:
-                await soniox_ws.send(b"")
-            except Exception:
-                pass
 
-    async def soniox_to_logic():
-        """
-        Читаем ответы от Soniox:
-        - логируем partial,
-        - собираем финальную реплику по is_final,
-        - по токену <end> запускаем GPT+TTS.
-        """
-        user_utterance = ""
-        try:
-            async for message in soniox_ws:
-                try:
-                    resp = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning(f"Non-JSON Soniox message: {message!r}")
-                    continue
 
-                if resp.get("error_code"):
-                    logger.error(
-                        "Soniox error %s: %s",
-                        resp.get("error_code"),
-                        resp.get("error_message"),
-                    )
-                    break
+# ============================
+#   HTTP endpoints
+# ============================
 
-                tokens = resp.get("tokens", [])
-                if not tokens:
-                    if resp.get("finished"):
-                        logger.info(
-                            "Soniox finished: final_audio_proc_ms=%s total_audio_proc_ms=%s",
-                            resp.get("final_audio_proc_ms"),
-                            resp.get("total_audio_proc_ms"),
-                        )
-                        break
-                    continue
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-                # partial лог
-                partial_text = "".join(t.get("text", "") for t in tokens)
-                if partial_text.strip():
-                    logger.info("Soniox partial: %s", partial_text)
 
-                # разбираем токены
-                for t in tokens:
-                    txt = t.get("text", "") or ""
-                    if txt == "<end>":
-                        final = user_utterance.strip()
-                        if final:
-                            # запускаем обработку фразы (без await — отдельная таска)
-                            asyncio.create_task(handle_user_utterance(final))
-                        user_utterance = ""
-                    elif t.get("is_final"):
-                        user_utterance += txt
+@app.post("/twilio/voice")
+async def twilio_voice(
+    request: Request,
+    CallSid: str = Form(None),
+    From: str = Form(None),
+    To: str = Form(None),
+):
+    logger.info("Incoming call: CallSid=%s, From=%s, To=%s", CallSid, From, To)
 
-        except Exception as e:
-            logger.exception(f"Error in soniox_to_logic: {e}")
+    host = request.url.hostname
 
-    try:
-        await asyncio.gather(
-            twilio_to_soniox(),
-            soniox_to_logic(),
-        )
-    finally:
-        logger.info("Closing Soniox WS and Twilio WS")
-        try:
-            await soniox_ws.close()
-        except Exception:
-            pass
-        try:
-            await ws.close()
-        except Exception:
-            pass
-        logger.info("twilio_stream handler finished")
+    # Простая приветственная фраза до подключения стрима
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="ru-RU" voice="woman">
+        Соединение установлено. Говорите, я вас слушаю.
+    </Say>
+    <Connect>
+        <Stream url="wss://{host}/twilio-stream" />
+    </Connect>
+</Response>"""
+
+    return Response(content=twiml.strip(), media_type="text/xml")
+
+
+@app.websocket("/twilio-stream")
+async def twilio_stream(ws: WebSocket):
+    await ws.accept()
+    logger.info("Twilio WebSocket connected")
+    session = CallSession(ws)
+    await session.run()
+    logger.info("twilio_stream handler finished")
