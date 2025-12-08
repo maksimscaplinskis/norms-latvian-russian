@@ -4,7 +4,6 @@ import base64
 import logging
 import asyncio
 import threading
-import audioop
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
@@ -46,7 +45,7 @@ SYSTEM_PROMPT = (
 )
 
 GREETING_TEXT = "Sveiki, kā es varu jums palīdzēt?"
-SPEECH_RMS_THRESHOLD = 800
+SPEECH_ENERGY_THRESHOLD = 18.0  # стартовый порог, будем смотреть по логам
 
 # ============================
 #   STT: Soniox
@@ -231,6 +230,25 @@ class CallSession:
         self._finished = False
         self._greeting_sent = False
 
+    @staticmethod
+    def _vad_energy_mu_law(audio_bytes: bytes) -> float:
+        """
+        Грубая оценка энергии аудио в μ-law:
+        считаем RMS по байтам вокруг центра 128.
+        Этого достаточно, чтобы понять, что клиент начал говорить.
+        """
+        if not audio_bytes:
+            return 0.0
+
+        acc = 0
+        n = len(audio_bytes)
+        for b in audio_bytes:
+            diff = b - 128  # центр
+            acc += diff * diff
+
+        # корень из средней квадратичной — RMS
+        return (acc / n) ** 0.5
+
     async def send_clear(self):
         """Отправляем в Twilio 'clear' для бардж-ина."""
         if not self.stream_sid:
@@ -393,21 +411,17 @@ class CallSession:
 
                     audio_bytes = base64.b64decode(payload_b64)
 
-                    # ---------- VAD для barge-in (по “сырым” данным) ----------
-                    # μ-law -> линейный PCM 16 bit
-                    try:
-                        lin16 = audioop.ulaw2lin(audio_bytes, 2)
-                        rms = audioop.rms(lin16, 2)
-                    except Exception as e:
-                        logger.warning("VAD error (audioop): %s", e)
-                        rms = 0
+                    # ---------- VAD для barge-in по μ-law байтам ----------
+                    if self.tts.is_active():
+                        energy = self._vad_energy_mu_law(audio_bytes)
+                        if energy > SPEECH_ENERGY_THRESHOLD:
+                            logger.info(
+                                "VAD speech detected (energy=%.2f) during TTS -> barge-in",
+                                energy,
+                            )
+                            await self.barge_in(reason=f"VAD energy={energy:.2f}")
 
-                    # Если ассистент говорит и RMS выше порога — считаем, что клиент перебил
-                    if self.tts.is_active() and rms > SPEECH_RMS_THRESHOLD:
-                        logger.info("VAD speech detected (rms=%d) during TTS -> barge-in", rms)
-                        await self.barge_in(reason=f"VAD rms={rms}")
-
-                    # ---------- Отправляем аудио в Soniox для распознавания ----------
+                    # ---------- Отправляем аудио в Soniox для STT ----------
                     try:
                         await self.stt.send_audio(audio_bytes)
                     except Exception as e:
