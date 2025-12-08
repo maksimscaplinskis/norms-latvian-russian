@@ -6,4 +6,4 @@ elevenlabs
 websockets
 httpx
 python-multipart
-audioop
+audioop-lts
