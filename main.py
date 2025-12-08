@@ -80,6 +80,7 @@ async def twilio_stream(ws: WebSocket):
         "num_channels": 1,
         "enable_language_identification": True,
         "language_hints": ["ru", "lv"],   # русский + латышский
+        "enable_endpoint_detection": True,  # <<< ВАЖНО
         "client_reference_id": "twilio-call",
     }
 
@@ -150,8 +151,13 @@ async def twilio_stream(ws: WebSocket):
 
     async def soniox_to_logs():
         """
-        Читаем ответы Soniox и логируем финальные токены (текст).
+        Читаем ответы Soniox:
+        - partial: почти мгновенный текст (final + non-final)
+        - final: подтверждённый текст (is_final = True), обычно после паузы или <end>
         """
+        current_partial = ""
+        current_final = ""
+
         try:
             async for message in soniox_ws:
                 try:
@@ -162,34 +168,50 @@ async def twilio_stream(ws: WebSocket):
 
                 if resp.get("error_code"):
                     logger.error(
-                        f"Soniox error {resp.get('error_code')}: "
-                        f"{resp.get('error_message')}"
+                        "Soniox error %s: %s",
+                        resp.get("error_code"),
+                        resp.get("error_message"),
                     )
                     break
 
                 tokens = resp.get("tokens", [])
-                # Собираем только финальные токены
-                final_text = "".join(
-                    t.get("text", "")
-                    for t in tokens
-                    if t.get("is_final")
+                if not tokens:
+                    # Может приходить пустой список при finished/keepalive и т.п.
+                    if resp.get("finished"):
+                        logger.info(
+                            "Soniox finished: final_audio_proc_ms=%s total_audio_proc_ms=%s",
+                            resp.get("final_audio_proc_ms"),
+                            resp.get("total_audio_proc_ms"),
+                        )
+                        break
+                    continue
+
+                # Полный текст (final + non-final) — для partial
+                text_all = "".join(t.get("text", "") for t in tokens)
+
+                # Только финальные токены — для final
+                text_final = "".join(
+                    t.get("text", "") for t in tokens if t.get("is_final")
                 )
 
-                if final_text:
+                # Partial: показывает, что слышит модель прямо сейчас
+                if text_all and text_all != current_partial:
+                    current_partial = text_all
+                    logger.info("Soniox partial: %s", current_partial)
+
+                # Final: подтверждённый текст после endpoint detection
+                if text_final and text_final != current_final:
+                    current_final = text_final
                     language = resp.get("language")
                     logger.info(
                         "Soniox final: %s %s",
-                        final_text,
+                        current_final,
                         f"(lang={language})" if language else "",
                     )
 
-                if resp.get("finished"):
-                    logger.info(
-                        "Soniox finished: final_audio_proc_ms=%s total_audio_proc_ms=%s",
-                        resp.get("final_audio_proc_ms"),
-                        resp.get("total_audio_proc_ms"),
-                    )
-                    break
+                # Отдельно можно ловить конец реплики по <end>
+                if any(t.get("text") == "<end>" for t in tokens):
+                    logger.info("Soniox: END OF UTTERANCE (<end> token)")
 
         except Exception as e:
             logger.exception(f"Error in soniox_to_logs: {e}")
