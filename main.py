@@ -49,6 +49,7 @@ SYSTEM_PROMPT = (
     "1. Darba pieredze"
     "2. Vārds, uzvārds"
     "3. Pieejamība (kad var sākt darbu)"
+    " - Neprasi telefonu numuru, neprasi epastu."
     "Pēc informācijas ievākšanas:"
     "• piedāvā tuvākās darbavietas, ja ir integrēta datubāze (pagaidam vari piedavat stradat kugu renovacijai)"
     "• vai piedāvā rezervēt sarunu/interviju, ja kandidāts atbilst"
