@@ -315,7 +315,7 @@ class CallSession:
                     model="gpt-5.1",
                     messages=msgs,
                     stream=True,
-                    max_completion_tokens=96,
+                    max_completion_tokens=64,
                     temperature=0.4,
                     reasoning_effort="none",
                 )
