@@ -46,7 +46,7 @@ SYSTEM_PROMPT = (
     – Nerunā sarežģīti, bez liekas medicīniskas terminoloģijas.
 
     STILS
-    – Ļoti īsas atbildes: 1–2 teikumi.
+    – Ļoti īsas atbildes: 1-1,5 teikumi.
     – Vienmēr tikai viens jautājums vienlaicīgi.
     – Neatkārto savus iepriekšējos teikumus vārds vārdā.
     – Nesāc ar „Labdien/Здравствуйте”, ja saruna jau notiek – ej uzreiz pie lietas.
@@ -108,7 +108,7 @@ class SttSession:
         # Конфиг для телефонного zvana (mulaw 8kHz, endpoint detection + LID) :contentReference[oaicite:2]{index=2}
         config_msg = {
             "api_key": self.api_key,
-            "model": "stt-rt-preview",
+            "model": "stt-rt-v3",
             "audio_format": "mulaw",
             "sample_rate": 8000,
             "num_channels": 1,
