@@ -319,7 +319,6 @@ class CallSession:
                     reasoning_effort="none",
                     frequency_penalty=0.3,
                     presence_penalty=0.0,
-                    ins
                 )
                 for chunk in stream:
                     if not chunk.choices:
