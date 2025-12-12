@@ -338,12 +338,12 @@ class CallSession:
             assistant_text = ""
             try:
                 stream = openai_client.chat.completions.create(
-                    model="gpt-5-mini",
+                    model="gpt-5.1",
                     messages=msgs,
                     stream=True,
-                    # max_completion_tokens=128,
-                    # temperature=0.5,
-                    # reasoning_effort="low",
+                    max_completion_tokens=128,
+                    temperature=0.5,
+                    reasoning_effort="none",
                 )
                 for chunk in stream:
                     if not chunk.choices:
