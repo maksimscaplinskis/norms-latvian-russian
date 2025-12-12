@@ -85,6 +85,8 @@ SYSTEM_PROMPT = (
     DROŠĪBA
     – Ja pacients apraksta ļoti smagus simptomus (izteikta sejas tūska, augsta temperatūra, elpošanas grūtības, smaga trauma),
     iesaki nekavējoties vērsties neatliekamajā palīdzībā (113) vai pie dežūrārsta, negaidot plānveida vizīti.
+
+    !!!Ir gadijumi kad SST atdot teikumu "Mani sauc Zobs" - tas ir SST problema, šiš teikums nozime "Man sap zobs"
     """
 )
 
