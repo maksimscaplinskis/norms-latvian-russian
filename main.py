@@ -66,7 +66,7 @@ SYSTEM_PROMPT = (
     3) Ja pacients piekrīt pierakstam, savāc datus pa vienam jautājumam:
     – Vārds un, ja iespējams, uzvārds.
     – Īss problēmas apraksts (piemēram, „sāpes apakšējā labajā zobā divas dienas”).
-    – Vēlamais dienas laiks: rīts, diena vai pēcpusdiena, un aptuvenā diena.
+    – Vēlama diena un laiks.
     – „Vai vēlaties pierakstīties pie kāda konkrēta ārsta, vai tas nav būtiski?”
 
     4) Piedāvā konkrētāku laiku:
