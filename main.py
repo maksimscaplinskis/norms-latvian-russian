@@ -60,21 +60,18 @@ SYSTEM_PROMPT = (
 
     2) Piedāvā vizīti (ja nav neatliekams gadījums):
     – Īsa informācija + maigs piedāvājums:
-    – „Mēs varam piedāvāt konsultāciju pie ārsta, lai izvērtētu situāciju un sastādītu plānu. Vai vēlaties pierakstīties uz vizīti?”
+    – „Mēs varam piedāvāt konsultāciju pie ārsta. Vai vēlaties pierakstīties uz vizīti?”
     – Ja pacients jau pats saka, ka grib pierakstīties, šo jautājumu vairs neuzdod – ej uz datu savākšanu.
 
     3) Ja pacients piekrīt pierakstam, savāc datus pa vienam jautājumam:
     – Vārds un, ja iespējams, uzvārds.
-    – Īss problēmas apraksts (piemēram, „sāpes zobā divas dienas”).
-    – Vēlama diena un laiks.
-    – „Vai vēlaties pierakstīties pie kāda konkrēta ārsta, vai tas nav būtiski?”
+    Ņem vērā klīnika strādā : P–Pk 08–16 un brīvdienās – pēc pieraksta.
+    – Piedāvā klientam , kurā datumā viņš vēlās vizīti pie ārsta un tad piedāvā piedāvā brīvo laiku.
+      Ja klienta izvēlētāis laiks ir aizņemts, piedāvā izvēlētajā datumā citu laiku.
+      Ja izvēlētajā datumā visi laiki ir aizņemti , piedāvā citā datumā nākamo brīvo laiku.
 
-    4) Piedāvā konkrētāku laiku:
-    – Ņem vērā: P–Pk 08–16, brīvdienās – pēc pieraksta.
-    – Piedāvā vienu konkrētu variantu („trešdien ap 10:00”). Ja neder – piedāvā citu, arī pa vienam.
-
-    5) Kopsavilkums un noslēgums:
-    – „Apstiprinu: [datums], ap [laiks], [īss pakalpojums/problēma] AM Dental Studio, Latgales iela 93, Rēzekne.”
+    4) Kopsavilkums un noslēgums:
+    – „Apstiprinu: [datums], ap [laiks], [īss pakalpojums/problēma] AM Dental Studio.”
     – Pateicies par zvanu/ziņu un pieklājīgi atvadies.
 
     INFORMĀCIJA BEZ DIAGNOZES
@@ -214,7 +211,7 @@ class TtsSession:
                         similarity_boost=0.0,
                         style=0.0,
                         use_speaker_boost=True,
-                        speed=1.5,
+                        speed=1.2,
                     ),
                 )
                 for chunk in response:
@@ -315,7 +312,7 @@ class CallSession:
             assistant_text = ""
             try:
                 stream = openai_client.chat.completions.create(
-                    model="gpt-5.1",
+                    model="gpt-5.2",
                     messages=msgs,
                     stream=True,
                     max_completion_tokens=64,
