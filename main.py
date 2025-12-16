@@ -113,7 +113,7 @@ class SttSession:
             "num_channels": 1,
             "enable_language_identification": True,
             "language_hints": ["ru", "lv"],
-            "enable_endpoint_detection": False, #TODO:Luche postavitj False
+            "enable_endpoint_detection": True, #TODO:Luche postavitj False
             "client_reference_id": "twilio-call",
         }
         await self.ws.send(json.dumps(config_msg))
@@ -403,8 +403,8 @@ class CallSession:
             return
 
         tokens = resp.get("tokens", [])
-        if tokens:
-            self._last_stt_activity_ts = self.loop.time()
+        # if tokens:
+        #     self._last_stt_activity_ts = self.loop.time()
         if not tokens:
             if resp.get("finished"):
                 logger.info(
@@ -434,14 +434,14 @@ class CallSession:
                 # продолжаем обрабатывать текст как обычно (накапливаем фразу)
 
             # --- MANUAL FINALIZATION MARKER ---
-            if txt == "<fin>":
-                final = self.user_utterance.strip()
-                logger.info("Soniox FIN token received, final user text: '%s'", final)
-                if final:
-                    asyncio.create_task(self.handle_user_utterance(final))
-                self.user_utterance = ""
-                self._finalize_inflight = False
-                continue
+            # if txt == "<fin>":
+            #     final = self.user_utterance.strip()
+            #     logger.info("Soniox FIN token received, final user text: '%s'", final)
+            #     if final:
+            #         asyncio.create_task(self.handle_user_utterance(final))
+            #     self.user_utterance = ""
+            #     self._finalize_inflight = False
+            #     continue
 
             # --- ENDPOINT DETECTION (fallback, если когда-то включите обратно) ---
             if txt == "<end>":
@@ -523,7 +523,7 @@ class CallSession:
             await asyncio.gather(
                 self.twilio_loop(),
                 self.stt_loop(),
-                self.stt_segmenter_loop(),
+                # self.stt_segmenter_loop(),
             )
         finally:
             await self.stt.close()
