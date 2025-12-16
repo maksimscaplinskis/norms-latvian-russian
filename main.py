@@ -56,7 +56,8 @@ SYSTEM_PROMPT = (
     1) Noskaidro mērķi:
     – „Pastāstiet, lūdzu, ar ko varam jums palīdzēt?”.
     – Saprot, vai tas ir: akūtas sāpes, plānota ārstēšana/plombe, higiēna/balināšana, bērns, implanti/protezēšana, zobu taisnošana, vai tikai jautājums (cena, adrese, darba laiks u.c.).
-
+    - Cilveks var uzreiz pateikt problemu, tad vairs nevajag jautat par problemu
+    
     2) Piedāvā vizīti (ja nav neatliekams gadījums):
     – Īsa informācija + maigs piedāvājums:
     – „Mēs varam piedāvāt konsultāciju pie ārsta. Vai vēlaties pierakstīties uz vizīti?”
@@ -77,9 +78,7 @@ SYSTEM_PROMPT = (
     – Par cenām: „Precīza cena atkarīga no situācijas, to vislabāk pateiks ārsts konsultācijā. Mēs varam piedāvāt laiku vizītei.”
     – Tu neesi ārsts: nestādi diagnozes un nesniedz detalizētu ārstēšanas shēmu. Sarežģītos jautājumos saki, ka to izvērtēs ārsts vizītē, un piedāvā pierakstu.
 
-    DROŠĪBA
-    – Ja pacients apraksta ļoti smagus simptomus (izteikta sejas tūska, augsta temperatūra, elpošanas grūtības, smaga trauma),
-    iesaki nekavējoties vērsties neatliekamajā palīdzībā (113) vai pie dežūrārsta, negaidot plānveida vizīti.
+    !!!Isuma tev vajag: Saprast problemu -> Piedavat viziti -> Pajautat Vardu/Uzvardu -> Piedavat dienu un laiku -> Pabeigt
 
     !!!Ir gadijumi kad SST atdot teikumu "Mani sauc Zobs" - tas ir SST problema, šiš teikums nozime "Man sap zobs"
     !!!Nejauta talruni/telefona numuru
@@ -114,7 +113,7 @@ class SttSession:
             "num_channels": 1,
             "enable_language_identification": True,
             "language_hints": ["ru", "lv"],
-            "enable_endpoint_detection": True, #TODO:Luche postavitj False
+            "enable_endpoint_detection": False, #TODO:Luche postavitj False
             "client_reference_id": "twilio-call",
         }
         await self.ws.send(json.dumps(config_msg))
@@ -131,6 +130,13 @@ class SttSession:
                 await self.ws.send(b"")
             except Exception:
                 pass
+
+    async def finalize_segment(self, trailing_silence_ms: int = 300):
+        """Принудительно финализировать текущий сегмент (manual finalization)."""
+        if not self.ws:
+            return
+        msg = {"type": "finalize", "trailing_silence_ms": trailing_silence_ms}
+        await self.ws.send(json.dumps(msg))
 
     async def receive_loop(self, handler):
         """Читаем все сообщения от Soniox и передаём в handler."""
@@ -258,6 +264,9 @@ class CallSession:
         self.stream_sid: str | None = None
         self.stt = SttSession(SONIOX_API_KEY)
         self.tts = TtsSession(eleven_client, ws, self.loop)
+        self._last_stt_activity_ts = self.loop.time()
+        self._last_finalize_sent_ts = 0.0
+        self._finalize_inflight = False
 
         # контекст для GPT
         self.messages = [
@@ -270,6 +279,39 @@ class CallSession:
         self.llm_lock = asyncio.Lock()
         self._finished = False
         self._greeting_sent = False
+
+    async def stt_segmenter_loop(self):
+        """
+        Если давно не приходили токены и есть накопленный текст — шлём Soniox {"type":"finalize"}.
+        Без endpoint detection это заменяет ожидание <end>.
+        """
+        IDLE_SECS = 0.9          # можно тюнить
+        MIN_INTERVAL_SECS = 2.0  # чтобы не флудить finalize (Soniox не рекомендует слишком часто)
+
+        while not self._finished:
+            await asyncio.sleep(0.1)
+
+            if not self.user_utterance.strip():
+                continue
+
+            idle = self.loop.time() - self._last_stt_activity_ts
+            if idle < IDLE_SECS:
+                continue
+
+            if self._finalize_inflight:
+                continue
+
+            if (self.loop.time() - self._last_finalize_sent_ts) < MIN_INTERVAL_SECS:
+                continue
+
+            self._finalize_inflight = True
+            self._last_finalize_sent_ts = self.loop.time()
+
+            try:
+                await self.stt.finalize_segment(trailing_silence_ms=300)
+            except Exception as e:
+                logger.exception("Error sending Soniox finalize: %s", e)
+                self._finalize_inflight = False
 
     async def send_clear(self):
         """Отправляем в Twilio 'clear' для бардж-ина."""
@@ -311,10 +353,10 @@ class CallSession:
             assistant_text = ""
             try:
                 stream = openai_client.chat.completions.create(
-                    model="gpt-5.2",
+                    model="gpt-5.1",
                     messages=msgs,
                     stream=True,
-                    max_completion_tokens=64,
+                    max_completion_tokens=80,
                     temperature=0.4,
                     reasoning_effort="none",
                 )
@@ -361,6 +403,8 @@ class CallSession:
             return
 
         tokens = resp.get("tokens", [])
+        if tokens:
+            self._last_stt_activity_ts = self.loop.time()
         if not tokens:
             if resp.get("finished"):
                 logger.info(
@@ -389,14 +433,23 @@ class CallSession:
                 # после этого TTS перестанет слать аудио, а Twilio очистит буфер
                 # продолжаем обрабатывать текст как обычно (накапливаем фразу)
 
-            # --- ENDPOINT DETECTION ---
+            # --- MANUAL FINALIZATION MARKER ---
+            if txt == "<fin>":
+                final = self.user_utterance.strip()
+                logger.info("Soniox FIN token received, final user text: '%s'", final)
+                if final:
+                    asyncio.create_task(self.handle_user_utterance(final))
+                self.user_utterance = ""
+                self._finalize_inflight = False
+                continue
+
+            # --- ENDPOINT DETECTION (fallback, если когда-то включите обратно) ---
             if txt == "<end>":
                 final = self.user_utterance.strip()
                 logger.info("Soniox END token received, final user text: '%s'", final)
                 if final:
                     asyncio.create_task(self.handle_user_utterance(final))
                 self.user_utterance = ""
-                # флаг отдельный больше не нужен, всё держим на user_utterance
                 continue
 
             # --- накапливаем только финальные токены в текущую реплику пользователя ---
@@ -470,6 +523,7 @@ class CallSession:
             await asyncio.gather(
                 self.twilio_loop(),
                 self.stt_loop(),
+                self.stt_segmenter_loop(),
             )
         finally:
             await self.stt.close()
