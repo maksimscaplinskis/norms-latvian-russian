@@ -99,19 +99,35 @@ GREETING_TEXT = "Labdien, AM Dental Studio. Kā varu palīdzēt?"
 class VadGate:
     def __init__(self):
         self.noise = 300.0
+        self.echo = 0.0
         self.speaking = False
         self.speech_frames = 0
         self.silence_frames = 0
 
-    def update(self, ulaw_bytes: bytes, allow_noise_update: bool = True):
-        pcm = audioop.ulaw2lin(ulaw_bytes, 2)      # 16-bit PCM
-        rms = audioop.rms(pcm, 2)                  # 0..32767
+    def reset_echo(self):
+        self.echo = 0.0
 
-        if allow_noise_update and not self.speaking:
-            # аккуратная оценка noise floor
+    def update(self, ulaw_bytes: bytes, *, tts_playback_active: bool) -> tuple[int, bool]:
+        pcm = audioop.ulaw2lin(ulaw_bytes, 2)
+        rms = audioop.rms(pcm, 2)
+
+        if tts_playback_active:
+            # оценка "эха" (уровень того, что возвращается, пока мы говорим)
+            if self.echo == 0.0:
+                self.echo = float(rms)
+            else:
+                self.echo = 0.98 * self.echo + 0.02 * float(rms)
+
+            thr = max(2200.0, self.echo * 1.7 + 600.0)   # ключевая строка
+            on_frames = 6   # >=120ms подряд
+            off_frames = 12 # >=240ms тишины
+        else:
+            # обычный noise floor, когда мы не говорим
             self.noise = 0.98 * self.noise + 0.02 * min(rms, 2000)
+            thr = max(900.0, self.noise * 3.0 + 200.0)
+            on_frames = 3
+            off_frames = 10
 
-        thr = max(700, self.noise * 3.0 + 150)     # тюнится
         is_speech_now = rms > thr
 
         if is_speech_now:
@@ -121,11 +137,9 @@ class VadGate:
             self.silence_frames += 1
             self.speech_frames = 0
 
-        # вход в речь: >= 60ms
-        if not self.speaking and self.speech_frames >= 3:
+        if not self.speaking and self.speech_frames >= on_frames:
             self.speaking = True
-        # выход из речи: >= 200ms тишины
-        if self.speaking and self.silence_frames >= 10:
+        if self.speaking and self.silence_frames >= off_frames:
             self.speaking = False
 
         return rms, self.speaking
@@ -492,6 +506,7 @@ class CallSession:
                 logger.info("GPT final reply: %s", reply)
 
                 self.last_tts_text = reply
+                self.vad.reset_echo()
                 self.tts_playback_active = True
                 self.barge_in_armed = False
                 self.pre_roll.clear()
@@ -605,10 +620,7 @@ class CallSession:
                     audio_bytes = base64.b64decode(payload_b64)
 
                     # VAD
-                    rms, speaking = self.vad.update(
-                        audio_bytes,
-                        allow_noise_update=not self.tts_playback_active
-                    )
+                    rms, speaking = self.vad.update(audio_bytes, tts_playback_active=self.tts_playback_active)
 
                     if self.tts_playback_active:
                         self.pre_roll.append(audio_bytes)
@@ -692,6 +704,7 @@ class CallSession:
         self.messages.append({"role": "assistant", "content": text})
 
         # Произносим через тот же TTS-пайплайн (barge-in уже работает)
+        self.vad.reset_echo()
         self.last_tts_text = text
         self.tts_playback_active = True
         self.barge_in_armed = False
