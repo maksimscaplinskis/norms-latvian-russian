@@ -4,6 +4,11 @@ import base64
 import logging
 import asyncio
 import threading
+import audioop
+import time
+import uuid
+from collections import deque
+from difflib import SequenceMatcher
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
@@ -90,6 +95,40 @@ GREETING_TEXT = "Labdien, AM Dental Studio. Kā varu palīdzēt?"
 # ============================
 #   STT: Soniox
 # ============================
+
+class VadGate:
+    def __init__(self):
+        self.noise = 300.0
+        self.speaking = False
+        self.speech_frames = 0
+        self.silence_frames = 0
+
+    def update(self, ulaw_bytes: bytes, allow_noise_update: bool = True):
+        pcm = audioop.ulaw2lin(ulaw_bytes, 2)      # 16-bit PCM
+        rms = audioop.rms(pcm, 2)                  # 0..32767
+
+        if allow_noise_update and not self.speaking:
+            # аккуратная оценка noise floor
+            self.noise = 0.98 * self.noise + 0.02 * min(rms, 2000)
+
+        thr = max(700, self.noise * 3.0 + 150)     # тюнится
+        is_speech_now = rms > thr
+
+        if is_speech_now:
+            self.speech_frames += 1
+            self.silence_frames = 0
+        else:
+            self.silence_frames += 1
+            self.speech_frames = 0
+
+        # вход в речь: >= 60ms
+        if not self.speaking and self.speech_frames >= 3:
+            self.speaking = True
+        # выход из речи: >= 200ms тишины
+        if self.speaking and self.silence_frames >= 10:
+            self.speaking = False
+
+        return rms, self.speaking
 
 class SttSession:
     def __init__(self, api_key: str):
@@ -187,16 +226,25 @@ class TtsSession:
             logger.info("TTS cancel requested")
         self._cancel_event.set()
 
-    async def speak(self, text: str):
-        """Стрим ElevenLabs TTS обратно в Twilio через media-сообщения."""
+    async def speak(self, text: str) -> str | None:
+        """Стрим ElevenLabs TTS обратно в Twilio через media-сообщения + mark в конце."""
+
         if not self.eleven_client:
             logger.warning("ELEVENLABS_API_KEY is not set, skip TTS")
-            return
+            return None
         if not self.stream_sid:
             logger.warning("streamSid is not set, skip TTS")
-            return
+            return None
         if not text.strip():
-            return
+            return None
+
+        mark_name = f"tts_end_{uuid.uuid4().hex[:10]}"
+
+        def _send(obj: dict):
+            fut = asyncio.run_coroutine_threadsafe(
+                self.ws.send_text(json.dumps(obj)), self.loop
+            )
+            fut.result()
 
         # сбрасываем cancel и помечаем, что сейчас говорим
         self._cancel_event.clear()
@@ -219,38 +267,68 @@ class TtsSession:
                         speed=1.2,
                     ),
                 )
+
+                frame_size = 160  # 20ms @ 8kHz mu-law
+                buf = b""
+
+                t0 = time.monotonic()
+                frames_sent = 0
+
                 for chunk in response:
                     if self._cancel_event.is_set():
                         logger.info("TTS streaming cancelled mid-stream")
                         break
-                    if not chunk:
-                        continue
-                    if not isinstance(chunk, (bytes, bytearray)):
+                    if not chunk or not isinstance(chunk, (bytes, bytearray)):
                         continue
 
-                    payload = base64.b64encode(chunk).decode("ascii")
-                    msg = {
+                    buf += bytes(chunk)
+
+                    # отправляем ровными 20ms фреймами
+                    while len(buf) >= frame_size:
+                        if self._cancel_event.is_set():
+                            break
+
+                        part = buf[:frame_size]
+                        buf = buf[frame_size:]
+
+                        payload = base64.b64encode(part).decode("ascii")
+                        _send({
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {"payload": payload},
+                        })
+
+                        # pacing: не быстрее реального времени
+                        frames_sent += 1
+                        target = t0 + frames_sent * 0.02
+                        sleep_s = target - time.monotonic()
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+
+                # добиваем остаток (если есть)
+                if not self._cancel_event.is_set() and buf:
+                    payload = base64.b64encode(buf).decode("ascii")
+                    _send({
                         "event": "media",
                         "streamSid": self.stream_sid,
                         "media": {"payload": payload},
-                    }
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self.ws.send_text(json.dumps(msg)),
-                        self.loop,
-                    )
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        logger.exception("Error sending audio to Twilio: %s", e)
-                        break
+                    })
+
+                # mark в самом конце (важно для tracking окончания TTS)
+                _send({
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": mark_name},
+                })
+
             except Exception as e:
                 logger.exception("Error in ElevenLabs TTS streaming: %s", e)
             finally:
                 self._active = False
                 logger.info("TTS thread finished")
 
-        # блокирующий TTS — в отдельном thread
         await asyncio.to_thread(_run)
+        return mark_name
 
 
 # ============================
@@ -267,6 +345,12 @@ class CallSession:
         self._last_stt_activity_ts = self.loop.time()
         self._last_finalize_sent_ts = 0.0
         self._finalize_inflight = False
+        self.vad = VadGate()
+        self.pre_roll = deque(maxlen=10)     # ~200ms если 20ms фреймы
+        self.tts_playback_active = False     # шире чем tts.is_active()
+        self.pending_marks: set[str] = set()
+        self.barge_in_armed = False
+        self.last_tts_text = ""
 
         # контекст для GPT
         self.messages = [
@@ -279,6 +363,18 @@ class CallSession:
         self.llm_lock = asyncio.Lock()
         self._finished = False
         self._greeting_sent = False
+
+    def _norm(self, s: str) -> str:
+        s = s.lower().strip()
+        s = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in s)
+        return " ".join(s.split())
+
+    def is_probable_echo(self, user_text: str) -> bool:
+        a = self._norm(user_text)
+        b = self._norm(self.last_tts_text)
+        if len(a) < 12 or len(b) < 12:
+            return False
+        return SequenceMatcher(None, a, b).ratio() >= 0.82
 
     async def stt_segmenter_loop(self):
         """
@@ -380,9 +476,13 @@ class CallSession:
         return assistant_text
 
     async def handle_user_utterance(self, text: str):
-        """Soniox дал <end> — закончили фразу пользователя."""
         text = text.strip()
         if not text:
+            return
+
+        # анти-эхо: если STT вернул то, что мы только что сказали
+        if self.is_probable_echo(text):
+            logger.info("Dropped probable echo: %r", text)
             return
 
         async with self.llm_lock:
@@ -390,7 +490,15 @@ class CallSession:
             reply = await self.generate_gpt_reply(text)
             if reply:
                 logger.info("GPT final reply: %s", reply)
-                await self.tts.speak(reply)
+
+                self.last_tts_text = reply
+                self.tts_playback_active = True
+                self.barge_in_armed = False
+                self.pre_roll.clear()
+
+                mark = await self.tts.speak(reply)
+                if mark:
+                    self.pending_marks.add(mark)
 
     async def handle_stt_response(self, resp: dict):
         # ошибки Soniox
@@ -478,17 +586,52 @@ class CallSession:
                         self._greeting_sent = True
                         asyncio.create_task(self.send_greeting())
 
+                elif event == "mark":
+                    name = (data.get("mark") or {}).get("name")
+                    if name:
+                        logger.info("Twilio mark received: %s", name)
+                        self.pending_marks.discard(name)
+
+                    if not self.pending_marks:
+                        self.tts_playback_active = False
+                        self.barge_in_armed = False
+                        self.pre_roll.clear()
+
                 elif event == "media":
                     media = data.get("media", {})
                     payload_b64 = media.get("payload")
                     if not payload_b64:
                         continue
                     audio_bytes = base64.b64decode(payload_b64)
-                    try:
-                        await self.stt.send_audio(audio_bytes)
-                    except Exception as e:
-                        logger.exception("Error sending audio to Soniox: %s", e)
-                        break
+
+                    # VAD
+                    rms, speaking = self.vad.update(
+                        audio_bytes,
+                        allow_noise_update=not self.tts_playback_active
+                    )
+
+                    if self.tts_playback_active:
+                        self.pre_roll.append(audio_bytes)
+
+                        # бардж-ин по VAD, а не по STT токенам
+                        if speaking and not self.barge_in_armed:
+                            self.barge_in_armed = True
+                            await self.barge_in(reason=f"VAD rms={rms}")
+
+                            # отправляем pre-roll в STT, чтобы не потерять начало фразы
+                            try:
+                                for b in list(self.pre_roll):
+                                    await self.stt.send_audio(b)
+                                self.pre_roll.clear()
+                            except Exception:
+                                pass
+
+                        # пока не “армнули” бардж-ин — НЕ шлём в STT (это и есть анти-эхо)
+                        if not self.barge_in_armed:
+                            continue
+
+                    # обычный режим — шлём в STT
+                    await self.stt.send_audio(audio_bytes)
 
                 elif event == "stop":
                     logger.info("Twilio stream STOP received")
@@ -549,7 +692,14 @@ class CallSession:
         self.messages.append({"role": "assistant", "content": text})
 
         # Произносим через тот же TTS-пайплайн (barge-in уже работает)
-        await self.tts.speak(text)
+        self.last_tts_text = text
+        self.tts_playback_active = True
+        self.barge_in_armed = False
+        self.pre_roll.clear()
+
+        mark = await self.tts.speak(text)
+        if mark:
+            self.pending_marks.add(mark)
 
 
 # ============================
