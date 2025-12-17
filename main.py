@@ -227,12 +227,20 @@ class TtsSession:
         self.stream_sid: str | None = None
         self._cancel_event = threading.Event()
         self._active = False
+        self._start_ts = 0.0
+        self._sent_any_audio = False
 
     def set_stream_sid(self, sid: str | None):
         self.stream_sid = sid
 
     def is_active(self) -> bool:
         return self._active
+    
+    def sent_any_audio(self) -> bool:
+        return self._sent_any_audio
+
+    def started_ago(self) -> float:
+        return time.monotonic() - self._start_ts if self._start_ts else 0.0
 
     def cancel(self):
         """Запросить остановку текущего TTS-стрима (для barge-in)."""
@@ -242,6 +250,9 @@ class TtsSession:
 
     async def speak(self, text: str) -> str | None:
         """Стрим ElevenLabs TTS обратно в Twilio через media-сообщения + mark в конце."""
+
+        self._start_ts = time.monotonic()
+        self._sent_any_audio = False
 
         if not self.eleven_client:
             logger.warning("ELEVENLABS_API_KEY is not set, skip TTS")
@@ -311,6 +322,7 @@ class TtsSession:
                             "streamSid": self.stream_sid,
                             "media": {"payload": payload},
                         })
+                        self._sent_any_audio = True
 
                         # pacing: не быстрее реального времени
                         frames_sent += 1
@@ -327,6 +339,7 @@ class TtsSession:
                         "streamSid": self.stream_sid,
                         "media": {"payload": payload},
                     })
+                    self._sent_any_audio = True
 
                 # mark в самом конце (важно для tracking окончания TTS)
                 _send({
@@ -438,18 +451,26 @@ class CallSession:
             logger.exception("Error sending Twilio clear: %s", e)
 
     async def barge_in(self, reason: str = ""):
-        """Barge-in: пользователь перебивает — рубим TTS и чистим буфер Twilio."""
-        if not self.tts.is_active():
+        # уже сработало — повторно не делаем clear
+        if self.barge_in_armed:
             return
-        if reason:
-            logger.info("BARGE-IN (%s): cancelling TTS and clearing Twilio audio", reason)
-        else:
-            logger.info("BARGE-IN: cancelling TTS and clearing Twilio audio")
 
-        # остановить TTS-стрим ElevenLabs
+        self.barge_in_armed = True
+        logger.info("BARGE-IN (%s): cancelling TTS and clearing Twilio audio", reason)
+
         self.tts.cancel()
-        # очистить буфер аудио в Twilio (media queue) 
         await self.send_clear()
+
+        # ВАЖНО: раз уж мы прервали TTS — считаем, что playback закончился
+        self.tts_playback_active = False
+        self.pending_marks.clear()
+
+        # чтобы pre-roll дальше не копился бесконечно
+        self.pre_roll.clear()
+
+        # если используете echo-floor в VAD — сбросьте его
+        if hasattr(self, "vad") and hasattr(self.vad, "reset_echo"):
+            self.vad.reset_echo()
 
     async def generate_gpt_reply(self, user_text: str) -> str:
         if not openai_client:
@@ -550,9 +571,9 @@ class CallSession:
                 continue
 
             # --- BARGE-IN: как только видим живой текст во время TTS ---
-            if txt.strip() and self.tts.is_active():
+            # if txt.strip() and self.tts.is_active():
                 # здесь можно указать reason, чтобы в логах было видно, по какому токену сработало
-                await self.barge_in(reason=f"token='{txt}'")
+                # await self.barge_in(reason=f"token='{txt}'")
                 # после этого TTS перестанет слать аудио, а Twilio очистит буфер
                 # продолжаем обрабатывать текст как обычно (накапливаем фразу)
 
@@ -626,8 +647,7 @@ class CallSession:
                         self.pre_roll.append(audio_bytes)
 
                         # бардж-ин по VAD, а не по STT токенам
-                        if speaking and not self.barge_in_armed:
-                            self.barge_in_armed = True
+                        if (self.tts.is_active() and self.tts.sent_any_audio() and speaking and not self.barge_in_armed):
                             await self.barge_in(reason=f"VAD rms={rms}")
 
                             # отправляем pre-roll в STT, чтобы не потерять начало фразы
