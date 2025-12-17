@@ -52,6 +52,7 @@ SYSTEM_PROMPT = (
     - Nesāc ar sveicienu; ej uzreiz pie lietas.
     - Nekad nesaki “uzrakstiet”; saki “pasakiet/sakiet lūdzu”.
     - Nekad nejautā telefona numuru.
+    - Nekad nejauc LV un RU valodu vienā atbildē.
 
     KLĪNIKAS INFO (sniedz tikai, ja jautā)
     - Darba laiks: P–Pk 08:00–16:00; brīvdienās – pēc pieraksta.
@@ -62,13 +63,16 @@ SYSTEM_PROMPT = (
     - Ja pacients saka “Mani sauc Zobs / mani sauc zobs”, interpretē to kā “Man sāp zobs” un turpini kā ar zobu sāpēm.
 
     SARUNAS LOĢIKA (iekšēji turpini ar mainīgajiem: iemesls, vai_grib_pierakstu, vards, datums, laiks)
+    PRIORITĀTE (nepārkāpt):
+    - Ja pacients jau pirmajā frāzē lūdz pierakstu (piem., “gribu pierakstīties”, “pierakstiet mani”, “vēlos vizīti”), NEKAD nepārjautā “vai vēlaties pierakstīties”; uzreiz pārej uz datu savākšanu (vārds/uzvārds) un tikai tad iemesls, ja tas vēl nav zināms.
+
     1) Ja iemesls nav zināms: pajautā iemeslu (1 teikums).
     - Ja pacients jau nosauca iemeslu (piem., “sāp zobs”, “gribu higiēnu”, “bērnam”, “implants”, “cik maksā”, “kur atrodaties”), NEPĀRJAUTĀ iemeslu.
     2) Ja pacients prasa tikai info (adrese, darba laiks, pakalpojumi, cenas): atbildi īsi un uzreiz (tajā pašā teikumā) maigi piedāvā vizīti.
     3) Ja iemesls zināms un pieraksts vēl nav piedāvāts:
     - Piedāvā vizīti ar 1 jautājumu: vai pierakstīt uz konsultāciju/apskati.
-    - Ja pacients pats jau grib pierakstīties: pārej uz datiem, nepiedāvā atkārtoti.
-    4) Ja pacients piekrīt pierakstam:
+    - Ja pacients pats jau grib pierakstīties (jebkurā brīdī): pārej uz datiem, nepiedāvā atkārtoti un nepārjautā.
+    4) Ja pacients piekrīt pierakstam vai jau lūdz pierakstu:
     a) pajautā vārdu un uzvārdu (1 teikums);
     b) pajautā, kurā datumā vēlētos vizīti (1 teikums);
     c) piedāvā brīvu laiku izvēlētajā datumā (vai 2 variantus 08:00–16:00) un pajautā, kurš der (1 teikums);
@@ -383,6 +387,15 @@ class CallSession:
         self.barge_in_armed = False
         self.last_tts_text = ""
 
+        # --- Patch A: post-TTS cooldown (анти-эхо) ---
+        self.post_tts_until = 0.0         # время до которого считаем, что идёт “эхо хвост”
+        self._cooldown_open = False       # откроем приём, когда VAD увидит реальную речь
+        self._vad_speaking = False        # последнее состояние VAD
+
+        # --- Patch D: debounce-склейка сегментов ---
+        self._pending_text = ""
+        self._pending_task: asyncio.Task | None = None
+
         # контекст для GPT
         self.messages = [
             {
@@ -475,6 +488,10 @@ class CallSession:
         if hasattr(self.vad, "reset_echo"):
             self.vad.reset_echo()
 
+        # раз уж VAD подтвердил перебивание — приём можно открыть сразу
+        self.post_tts_until = 0.0
+        self._cooldown_open = True
+
     async def generate_gpt_reply(self, user_text: str) -> str:
         if not openai_client:
             logger.warning("OPENAI_API_KEY is not set, skip GPT call")
@@ -520,11 +537,11 @@ class CallSession:
             return
 
         # короткое эхо: "Labdien", "Jā" часто приходит как подстрока последнего TTS
-        a = self._norm(text)
-        b = self._norm(self.last_tts_text)
-        if a and b and len(a) <= 12 and a in b:
-            logger.info("Dropped short echo-substring: %r (in last_tts=%r)", text, self.last_tts_text)
-            return
+        # a = self._norm(text)
+        # b = self._norm(self.last_tts_text)
+        # if a and b and len(a) <= 12 and a in b:
+        #     logger.info("Dropped short echo-substring: %r (in last_tts=%r)", text, self.last_tts_text)
+        #     return
 
         # анти-эхо по similarity
         if self.is_probable_echo(text):
@@ -544,6 +561,9 @@ class CallSession:
             self.tts_playback_active = True
             self.barge_in_armed = False
             self.pre_roll.clear()
+
+            self.post_tts_until = 0.0
+            self._cooldown_open = False
 
             mark = await self.tts.speak(reply)
             if mark:
@@ -573,6 +593,15 @@ class CallSession:
                     resp.get("total_audio_proc_ms"),
                 )
                 self._finished = True
+            return
+        
+        # Patch C: анти-эхо на уровне токенов (аудио всё равно идёт в Soniox)
+        now = time.monotonic()
+        accepting = (not self.tts_playback_active) and (now >= self.post_tts_until or self._cooldown_open)
+
+        if not accepting:
+            # пока приём закрыт — не накапливаем эхо в user_utterance
+            self.user_utterance = ""
             return
 
         # лог партиалов (для понимания задержки)
@@ -608,13 +637,37 @@ class CallSession:
                 final = self.user_utterance.strip()
                 logger.info("Soniox END token received, final user text: '%s'", final)
                 if final:
-                    asyncio.create_task(self.handle_user_utterance(final))
+                    self.queue_user_text(final, delay=0.7)
                 self.user_utterance = ""
                 continue
 
             # --- накапливаем только финальные токены в текущую реплику пользователя ---
             if t.get("is_final"):
                 self.user_utterance += txt
+
+    async def _flush_pending(self, delay: float = 0.7):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        text = self._pending_text.strip()
+        self._pending_text = ""
+        if text:
+            await self.handle_user_utterance(text)
+
+    def queue_user_text(self, text: str, delay: float = 0.7):
+        text = text.strip()
+        if not text:
+            return
+
+        if self._pending_text:
+            self._pending_text = f"{self._pending_text} {text}"
+        else:
+            self._pending_text = text
+
+        if self._pending_task and not self._pending_task.done():
+            self._pending_task.cancel()
+        self._pending_task = asyncio.create_task(self._flush_pending(delay=delay))
 
     async def twilio_loop(self):
         """Читаем события Twilio и шлём аудио в Soniox."""
@@ -648,6 +701,11 @@ class CallSession:
                         self.tts_playback_active = False
                         self.barge_in_armed = False
                         self.pre_roll.clear()
+
+                        # Patch A: после конца TTS даём эху “осесть”
+                        self.post_tts_until = time.monotonic() + 0.6  # 600ms (тюнится)
+                        self._cooldown_open = False
+
                         if hasattr(self.vad, "reset_echo"):
                             self.vad.reset_echo()
 
@@ -661,6 +719,11 @@ class CallSession:
                     # VAD
                     rms, speaking = self.vad.update(audio_bytes, tts_playback_active=self.tts_playback_active)
 
+                    # Patch A: запоминаем VAD и “открываем” приём в cooldown-окне, когда реально началась речь
+                    self._vad_speaking = speaking
+                    if time.monotonic() < self.post_tts_until and speaking:
+                        self._cooldown_open = True
+
                     # WATCHDOG: если TTS активен, но ещё не отправил ни одного аудио слишком долго — снимаем gating
                     if self.tts_playback_active and self.tts.is_active() and (not self.tts.sent_any_audio()):
                         if self.tts.started_ago() > 2.0:
@@ -672,13 +735,16 @@ class CallSession:
                             if hasattr(self.vad, "reset_echo"):
                                 self.vad.reset_echo()
 
+                            # Patch A: если сняли gating — больше не ждём cooldown
+                            self.post_tts_until = 0.0
+                            self._cooldown_open = True
+
                     if self.tts_playback_active:
                         # копим pre-roll всегда, пока идёт playback
                         self.pre_roll.append(audio_bytes)
 
-                        # barge-in только если TTS реально начал отдавать аудио (иначе вы отменяете "пустоту")
+                        # barge-in только если TTS реально начал отдавать аудио
                         if (self.tts.is_active() and self.tts.sent_any_audio() and speaking and not self.barge_in_armed):
-                            # берём snapshot pre-roll ДО barge_in (barge_in больше не чистит pre_roll, но так надежнее)
                             pre = list(self.pre_roll)
                             self.pre_roll.clear()
 
@@ -691,12 +757,9 @@ class CallSession:
                             except Exception:
                                 pass
 
-                        # пока не “перебили” — НЕ шлём в STT (анти-эхо)
-                        if not self.barge_in_armed:
-                            continue
-
-                    # обычный режим — шлём в STT
+                    # Patch B: ВАЖНО — всегда шлём аудио в Soniox (иначе 408 timeout)
                     await self.stt.send_audio(audio_bytes)
+
 
                 elif event == "stop":
                     logger.info("Twilio stream STOP received")
@@ -762,6 +825,9 @@ class CallSession:
         self.tts_playback_active = True
         self.barge_in_armed = False
         self.pre_roll.clear()
+
+        self.post_tts_until = 0.0
+        self._cooldown_open = False
 
         mark = await self.tts.speak(text)
         if mark:
