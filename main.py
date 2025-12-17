@@ -103,11 +103,24 @@ class VadGate:
         self.speaking = False
         self.speech_frames = 0
         self.silence_frames = 0
+        self._last_mode: bool | None = None  # False/True, чтобы сбрасывать counters при переключении
 
     def reset_echo(self):
         self.echo = 0.0
 
+    def _reset_state(self):
+        self.speaking = False
+        self.speech_frames = 0
+        self.silence_frames = 0
+
     def update(self, ulaw_bytes: bytes, *, tts_playback_active: bool) -> tuple[int, bool]:
+        # сброс накоплений при переключении режима
+        if self._last_mode is None:
+            self._last_mode = tts_playback_active
+        elif self._last_mode != tts_playback_active:
+            self._last_mode = tts_playback_active
+            self._reset_state()
+
         pcm = audioop.ulaw2lin(ulaw_bytes, 2)
         rms = audioop.rms(pcm, 2)
 
@@ -118,11 +131,11 @@ class VadGate:
             else:
                 self.echo = 0.98 * self.echo + 0.02 * float(rms)
 
-            thr = max(2200.0, self.echo * 1.7 + 600.0)   # ключевая строка
-            on_frames = 6   # >=120ms подряд
-            off_frames = 12 # >=240ms тишины
+            thr = max(2200.0, self.echo * 1.7 + 600.0)
+            on_frames = 6    # >=120ms
+            off_frames = 12  # >=240ms
         else:
-            # обычный noise floor, когда мы не говорим
+            # обычный noise floor
             self.noise = 0.98 * self.noise + 0.02 * min(rms, 2000)
             thr = max(900.0, self.noise * 3.0 + 200.0)
             on_frames = 3
@@ -461,15 +474,14 @@ class CallSession:
         self.tts.cancel()
         await self.send_clear()
 
-        # ВАЖНО: раз уж мы прервали TTS — считаем, что playback закончился
+        # раз уж прервали TTS — считаем, что playback закончен
         self.tts_playback_active = False
         self.pending_marks.clear()
 
-        # чтобы pre-roll дальше не копился бесконечно
-        self.pre_roll.clear()
+        # ВАЖНО: pre_roll НЕ чистим здесь!
+        # Он должен быть отправлен в STT после barge_in в twilio_loop
 
-        # если используете echo-floor в VAD — сбросьте его
-        if hasattr(self, "vad") and hasattr(self.vad, "reset_echo"):
+        if hasattr(self.vad, "reset_echo"):
             self.vad.reset_echo()
 
     async def generate_gpt_reply(self, user_text: str) -> str:
@@ -515,7 +527,14 @@ class CallSession:
         if not text:
             return
 
-        # анти-эхо: если STT вернул то, что мы только что сказали
+        # короткое эхо: "Labdien", "Jā" часто приходит как подстрока последнего TTS
+        a = self._norm(text)
+        b = self._norm(self.last_tts_text)
+        if a and b and len(a) <= 12 and a in b:
+            logger.info("Dropped short echo-substring: %r (in last_tts=%r)", text, self.last_tts_text)
+            return
+
+        # анти-эхо по similarity
         if self.is_probable_echo(text):
             logger.info("Dropped probable echo: %r", text)
             return
@@ -523,18 +542,23 @@ class CallSession:
         async with self.llm_lock:
             logger.info("User utterance (final): %s", text)
             reply = await self.generate_gpt_reply(text)
-            if reply:
-                logger.info("GPT final reply: %s", reply)
+            if not reply:
+                return
 
-                self.last_tts_text = reply
-                self.vad.reset_echo()
-                self.tts_playback_active = True
-                self.barge_in_armed = False
-                self.pre_roll.clear()
+            logger.info("GPT final reply: %s", reply)
 
-                mark = await self.tts.speak(reply)
-                if mark:
-                    self.pending_marks.add(mark)
+            self.last_tts_text = reply
+            self.vad.reset_echo()
+            self.tts_playback_active = True
+            self.barge_in_armed = False
+            self.pre_roll.clear()
+
+            mark = await self.tts.speak(reply)
+            if mark:
+                self.pending_marks.add(mark)
+            else:
+                # если TTS не стартанул/упал — не залипаем в playback_active
+                self.tts_playback_active = False
 
     async def handle_stt_response(self, resp: dict):
         # ошибки Soniox
@@ -632,6 +656,8 @@ class CallSession:
                         self.tts_playback_active = False
                         self.barge_in_armed = False
                         self.pre_roll.clear()
+                        if hasattr(self.vad, "reset_echo"):
+                            self.vad.reset_echo()
 
                 elif event == "media":
                     media = data.get("media", {})
@@ -643,22 +669,37 @@ class CallSession:
                     # VAD
                     rms, speaking = self.vad.update(audio_bytes, tts_playback_active=self.tts_playback_active)
 
+                    # WATCHDOG: если TTS активен, но ещё не отправил ни одного аудио слишком долго — снимаем gating
+                    if self.tts_playback_active and self.tts.is_active() and (not self.tts.sent_any_audio()):
+                        if self.tts.started_ago() > 2.0:
+                            logger.warning("TTS stalled before first audio; disabling playback gating")
+                            self.tts_playback_active = False
+                            self.pending_marks.clear()
+                            self.barge_in_armed = False
+                            self.pre_roll.clear()
+                            if hasattr(self.vad, "reset_echo"):
+                                self.vad.reset_echo()
+
                     if self.tts_playback_active:
+                        # копим pre-roll всегда, пока идёт playback
                         self.pre_roll.append(audio_bytes)
 
-                        # бардж-ин по VAD, а не по STT токенам
+                        # barge-in только если TTS реально начал отдавать аудио (иначе вы отменяете "пустоту")
                         if (self.tts.is_active() and self.tts.sent_any_audio() and speaking and not self.barge_in_armed):
+                            # берём snapshot pre-roll ДО barge_in (barge_in больше не чистит pre_roll, но так надежнее)
+                            pre = list(self.pre_roll)
+                            self.pre_roll.clear()
+
                             await self.barge_in(reason=f"VAD rms={rms}")
 
                             # отправляем pre-roll в STT, чтобы не потерять начало фразы
                             try:
-                                for b in list(self.pre_roll):
+                                for b in pre:
                                     await self.stt.send_audio(b)
-                                self.pre_roll.clear()
                             except Exception:
                                 pass
 
-                        # пока не “армнули” бардж-ин — НЕ шлём в STT (это и есть анти-эхо)
+                        # пока не “перебили” — НЕ шлём в STT (анти-эхо)
                         if not self.barge_in_armed:
                             continue
 
@@ -733,6 +774,8 @@ class CallSession:
         mark = await self.tts.speak(text)
         if mark:
             self.pending_marks.add(mark)
+        else:
+            self.tts_playback_active = False
 
 
 # ============================
