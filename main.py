@@ -221,6 +221,11 @@ class SttSession:
                 pass
             self.ws = None
 
+    async def keepalive(self):
+        if self.ws:
+            await self.ws.send(json.dumps({"type": "keepalive"}))
+
+
 
 # ============================
 #   TTS: ElevenLabs -> Twilio
@@ -385,6 +390,12 @@ class CallSession:
         self.pending_marks: set[str] = set()
         self.barge_in_armed = False
         self.last_tts_text = ""
+        self._last_soniox_send_ts = self.loop.time()
+
+        self.last_tts_end_ts = 0.0
+        self._turn_buf = ""
+        self._turn_flush_task: asyncio.Task | None = None
+        self._last_user_speech_ts = 0.0
 
         # контекст для GPT
         self.messages = [
@@ -397,6 +408,29 @@ class CallSession:
         self.llm_lock = asyncio.Lock()
         self._finished = False
         self._greeting_sent = False
+
+    TURN_MERGE_WINDOW = 0.7  # 0.5–0.9 обычно оптимально
+
+    def _arm_turn_flush(self):
+        if self._turn_flush_task and not self._turn_flush_task.done():
+            self._turn_flush_task.cancel()
+        self._turn_flush_task = asyncio.create_task(self._turn_flush_worker())
+
+    async def _turn_flush_worker(self):
+        try:
+            await asyncio.sleep(self.TURN_MERGE_WINDOW)
+        except asyncio.CancelledError:
+            return
+
+        # если пользователь всё ещё говорил недавно — подождём ещё
+        if self.loop.time() - self._last_user_speech_ts < self.TURN_MERGE_WINDOW:
+            self._arm_turn_flush()
+            return
+
+        text = self._turn_buf.strip()
+        self._turn_buf = ""
+        if text:
+            asyncio.create_task(self.handle_user_utterance(text))
 
     def _norm(self, s: str) -> str:
         s = s.lower().strip()
@@ -610,9 +644,12 @@ class CallSession:
             if txt == "<end>":
                 final = self.user_utterance.strip()
                 logger.info("Soniox END token received, final user text: '%s'", final)
-                if final:
-                    asyncio.create_task(self.handle_user_utterance(final))
                 self.user_utterance = ""
+
+                if final:
+                    self._turn_buf = (self._turn_buf + " " + final).strip() if self._turn_buf else final
+                    self._arm_turn_flush()
+
                 continue
 
             # --- накапливаем только финальные токены в текущую реплику пользователя ---
@@ -663,6 +700,8 @@ class CallSession:
 
                     # VAD
                     rms, speaking = self.vad.update(audio_bytes, tts_playback_active=self.tts_playback_active)
+                    if (not self.tts_playback_active) and speaking:
+                        self._last_user_speech_ts = self.loop.time()
 
                     # WATCHDOG: если TTS активен, но ещё не отправил ни одного аудио слишком долго — снимаем gating
                     if self.tts_playback_active and self.tts.is_active() and (not self.tts.sent_any_audio()):
@@ -691,6 +730,7 @@ class CallSession:
                             try:
                                 for b in pre:
                                     await self.stt.send_audio(b)
+                                    self._last_soniox_send_ts = self.loop.time()
                             except Exception:
                                 pass
 
@@ -700,6 +740,7 @@ class CallSession:
 
                     # обычный режим — шлём в STT
                     await self.stt.send_audio(audio_bytes)
+                    self._last_soniox_send_ts = self.loop.time()
 
                 elif event == "stop":
                     logger.info("Twilio stream STOP received")
@@ -715,6 +756,18 @@ class CallSession:
         except Exception as e:
             logger.exception("Error in twilio_loop: %s", e)
             await self.stt.finalize()
+
+    async def stt_keepalive_loop(self):
+        while not self._finished:
+            await asyncio.sleep(5)
+
+            # если давно не слали аудио (например, во время TTS gating) — шлём keepalive
+            if self.loop.time() - self._last_soniox_send_ts > 5:
+                try:
+                    await self.stt.keepalive()
+                    logger.debug("Sent Soniox keepalive")
+                except Exception:
+                    pass
 
     async def stt_loop(self):
         """Цикл чтения результатов Soniox."""
@@ -735,6 +788,7 @@ class CallSession:
                 self.twilio_loop(),
                 self.stt_loop(),
                 # self.stt_segmenter_loop(),
+                self.stt_keepalive_loop(),
             )
         finally:
             await self.stt.close()
