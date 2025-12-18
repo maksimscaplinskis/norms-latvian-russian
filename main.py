@@ -409,7 +409,7 @@ class CallSession:
         self._finished = False
         self._greeting_sent = False
 
-    TURN_MERGE_WINDOW = 0.7  # 0.5–0.9 обычно оптимально
+    TURN_MERGE_WINDOW = 0.6  # 0.5–0.9 обычно оптимально
 
     def _arm_turn_flush(self):
         if self._turn_flush_task and not self._turn_flush_task.done():
@@ -697,6 +697,22 @@ class CallSession:
                     if not payload_b64:
                         continue
                     audio_bytes = base64.b64decode(payload_b64)
+
+                    # TTS мог уже закончиться, но mark ещё не пришёл — снимаем gating и отдаём накопленный pre-roll в STT
+                    if self.tts_playback_active and (not self.tts.is_active()):
+                        if self.pre_roll:
+                            try:
+                                for b in self.pre_roll:
+                                    await self.stt.send_audio(b)
+                                    self._last_soniox_send_ts = self.loop.time()
+                            except Exception:
+                                pass
+                        self.pre_roll.clear()
+                        self.tts_playback_active = False
+                        self.barge_in_armed = False
+                        self.pending_marks.clear()
+                        if hasattr(self.vad, "reset_echo"):
+                            self.vad.reset_echo()
 
                     # VAD
                     rms, speaking = self.vad.update(audio_bytes, tts_playback_active=self.tts_playback_active)
