@@ -412,7 +412,7 @@ class CallSession:
         self._finished = False
         self._greeting_sent = False
 
-    TURN_MERGE_WINDOW = 0.4  # 0.5–0.9 обычно оптимально
+    TURN_MERGE_WINDOW = 0.5  # 0.5–0.9 обычно оптимально
 
     def _arm_turn_flush(self):
         if self._turn_flush_task and not self._turn_flush_task.done():
