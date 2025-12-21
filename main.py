@@ -37,50 +37,52 @@ eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY els
 # Максимально простой промпт под автосервис
 SYSTEM_PROMPT = (
     """
-    Tu esi AM Dental Studio (Rēzekne, Latgales iela 93) zobārstniecības klīnikas AI VOICE administrators.
+    You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
 
-    Mērķis: saprast iemeslu un, ja tas ir saprātīgi, novest līdz pierakstam vizītei. Tu neesi ārsts: nediagnosticē, nedod ārstēšanas shēmas; sarežģīto izvērtē ārsts vizītē.
+    GOAL
+    Understand the caller’s need and, when appropriate, book a visit.
+    You are not a doctor: do not diagnose or provide treatment plans; the dentist evaluates in-person.
 
-    VALODA
-    - Pēc pirmajiem pacienta vārdiem nosaki LV vai RU un turpini tikai tajā valodā, līdz pacients skaidri palūdz mainīt.
-    - Ja valoda nav skaidra: vienā īsā teikumā pajautā “Latviski vai krieviski?” (bilingvāli vienā teikumā).
+    LANGUAGE (LV/RU) — IMPORTANT
+    - Do NOT ask “which language do you prefer”.
+    - Never mix Latvian and Russian in the same answer.
 
-    STILS (VOICE)
-    - Atbildi ĻOTI īsi: 1 teikums, max ~12–14 vārdi; bez liekas informācijas.
-    - Vienlaikus tikai 1 jautājums.
-    - Neatkārto vienu un to pašu; ja neatbild, pārfrāzē tikai 1 reizi.
-    - Nesāc ar sveicienu; ej uzreiz pie lietas.
-    - Nekad nesaki “uzrakstiet”; saki “pasakiet/sakiet lūdzu”.
-    - Nekad nejautā telefona numuru.
-    - Nekad nejauc LV un RU valodu vienā atbildē.
+    VOICE STYLE (STRICT)
+    - One sentence only, ideally 12–14 words.
+    - Ask only ONE question per turn.
+    - No repetition; if no answer, rephrase only once.
+    - No greetings (assume the greeting already happened).
+    - Never say “write”; say “please tell/say”.
+    - Never ask for a phone number.
 
-    KLĪNIKAS INFO (sniedz tikai, ja jautā)
-    - Darba laiks: P–Pk 08:00–16:00; brīvdienās – pēc pieraksta.
-    - Pakalpojumi: ārstēšana, higiēna, protezēšana, implanti, ķirurģija, kape (zobu taisnošana), pieaugušie un bērni.
-    - Par cenām: “Precīza cena atkarīga no situācijas; to pateiks ārsts konsultācijā.”
+    CLINIC INFO (ONLY if asked)
+    - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
+    - Services: treatment, hygiene, prosthetics, implants, surgery, aligners/caps, adults and children.
+    - Prices: “Exact price depends on your case; the dentist will confirm at consultation.”
+    - Address: Rēzekne, Latgales iela 93.
 
-    SPECIĀLS STT NOTEIKUMS
-    - Ja pacients saka “Mani sauc Zobs / mani sauc zobs”, interpretē to kā “Man sāp zobs” un turpini kā ar zobu sāpēm.
+    SPECIAL STT RULE
+    If caller says “Mani sauc Zobs / mani sauc zobs”, interpret as “Man sāp zobs” (toothache).
 
-    SARUNAS LOĢIKA (iekšēji turpini ar mainīgajiem: iemesls, vai_grib_pierakstu, vards, datums, laiks)
-    PRIORITĀTE (nepārkāpt):
-    - Ja pacients jau pirmajā frāzē lūdz pierakstu (piem., “gribu pierakstīties”, “pierakstiet mani”, “vēlos vizīti”), NEKAD nepārjautā “vai vēlaties pierakstīties”; uzreiz pārej uz datu savākšanu (vārds/uzvārds) un tikai tad iemesls, ja tas vēl nav zināms.
+    BOOKING LOGIC (highest priority)
+    - If the caller asks to book immediately (e.g., “pierakstiet mani / gribu pierakstīties” or “запишите меня / хочу записаться”),
+    never ask “do you want to book?” — immediately start booking.
 
-    1) Ja iemesls nav zināms: pajautā iemeslu (1 teikums).
-    - Ja pacients jau nosauca iemeslu (piem., “sāp zobs”, “gribu higiēnu”, “bērnam”, “implants”, “cik maksā”, “kur atrodaties”), NEPĀRJAUTĀ iemeslu.
-    2) Ja pacients prasa tikai info (adrese, darba laiks, pakalpojumi, cenas): atbildi īsi un uzreiz (tajā pašā teikumā) maigi piedāvā vizīti.
-    3) Ja iemesls zināms un pieraksts vēl nav piedāvāts:
-    - Piedāvā vizīti ar 1 jautājumu: vai pierakstīt uz konsultāciju/apskati, bet ja pacients pats jau grib pierakstīties (jebkurā brīdī): pārej uz datiem, nepiedāvā atkārtoti un nepārjautā.
-    4) Ja pacients piekrīt pierakstam vai jau lūdz pierakstu:
-    a) pajautā vārdu un uzvārdu (1 teikums);
-    b) pajautā, kurā datumā vēlētos vizīti (1 teikums);
-    c) piedāvā brīvu laiku izvēlētajā datumā (vai 2 variantus 08:00–16:00) un pajautā, kurš der (1 teikums);
-    d) ja izvēlētais laiks aizņemts: tajā pašā datumā piedāvā citu laiku;
-    e) ja datumā nav brīvu laiku: piedāvā nākamo tuvāko brīvo datumu ar laiku.
-    5) Noslēgums: vienā teikumā apstiprini “datums, laiks, iemesls, AM Dental Studio” un pieklājīgi noslēdz.
+    FLOW (one question per turn)
+    1) If reason is unknown: ask the reason. If already stated, do not ask again.
+    2) If caller asks only for info (address/hours/services/prices): answer briefly AND in the same sentence gently offer a visit.
+    3) If reason is known and booking not offered yet: offer a visit with one question.
+    If caller asks to book at any time: go to booking steps immediately (no re-offer).
+    4) Booking steps:
+    a) Ask first name + last name.
+    b) Ask desired date.
+    c) Offer 2 time options within 08:00–16:00 and ask which fits.
+    d) If chosen time is taken: offer another time same date.
+    e) If no times on that date: offer the nearest next available date/time.
+    5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
 
-    DROŠĪBA
-    - Ja ir spēcīga tūska, elpošanas grūtības vai nekontrolējama asiņošana: īsi pasaki, ka jāsazinās ar neatliekamo palīdzību (112) un piedāvā tuvāko vizīti, ja iespējams.
+    SAFETY
+    If severe swelling, breathing difficulty, or uncontrolled bleeding: say to call emergency (112).
     """
 )
 
@@ -396,6 +398,7 @@ class CallSession:
         self._turn_buf = ""
         self._turn_flush_task: asyncio.Task | None = None
         self._last_user_speech_ts = 0.0
+        self.lang_locked: str | None = None  # "ru" | "lv"
 
         # контекст для GPT
         self.messages = [
@@ -409,7 +412,7 @@ class CallSession:
         self._finished = False
         self._greeting_sent = False
 
-    TURN_MERGE_WINDOW = 0.6  # 0.5–0.9 обычно оптимально
+    TURN_MERGE_WINDOW = 0.4  # 0.5–0.9 обычно оптимально
 
     def _arm_turn_flush(self):
         if self._turn_flush_task and not self._turn_flush_task.done():
@@ -436,6 +439,87 @@ class CallSession:
         s = s.lower().strip()
         s = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in s)
         return " ".join(s.split())
+
+    def _detect_lang(self, text: str) -> str | None:
+        t = text.lower()
+        has_cyr = any("а" <= ch <= "я" or ch == "ё" for ch in t)
+        if has_cyr:
+            return "ru"
+        latv_chars = set("āčēģīķļņšūž")
+        if any(ch in latv_chars for ch in t):
+            return "lv"
+        has_ascii = any(ch.isalpha() and ch.isascii() for ch in t)
+        if has_ascii:
+            return "lv"
+        return None
+
+    async def _detect_lang_switch_via_llm(self, text: str) -> str | None:
+        """
+        Tool calling: переключаем язык только по явной просьбе.
+        Игнорируем перечисления языков без команды переключения.
+        """
+        if not openai_client:
+            return None
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "detect_language_switch",
+                "description": "Call only if the user explicitly asked to switch the conversation language. Ignore mentions of language proficiency or lists of languages.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "language": {
+                            "type": "string",
+                            "enum": ["ru", "lv"],
+                            "description": "Target language requested by the user ('ru' for Russian, 'lv' for Latvian).",
+                        }
+                    },
+                    "required": ["language"],
+                },
+            },
+        }
+
+        messages = [
+            {
+                "role": "system",
+                "content": "If the user explicitly asks to switch the conversation language to Russian or Latvian, call the detect_language_switch tool. Do not call it for general mentions of languages or proficiency lists.",
+            },
+            {"role": "user", "content": text},
+        ]
+
+        try:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                tools=[tool],
+                tool_choice="auto",
+                max_completion_tokens=16,
+                temperature=0.0,
+                reasoning_effort="none",
+                verbosity="low",
+            )
+        except Exception as e:
+            logger.exception("Error detecting language switch via tool call: %s", e)
+            return None
+
+        if not resp.choices:
+            return None
+
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            if not fn or fn.name != "detect_language_switch":
+                continue
+            try:
+                args = json.loads(fn.arguments or "{}")
+            except json.JSONDecodeError:
+                continue
+            lang = args.get("language")
+            if lang in ("ru", "lv"):
+                return lang
+        return None
 
     def is_probable_echo(self, user_text: str) -> bool:
         a = self._norm(user_text)
@@ -519,6 +603,12 @@ class CallSession:
 
         self.messages.append({"role": "user", "content": user_text})
         messages_for_call = list(self.messages)
+        if self.lang_locked:
+            lang_name = "Russian" if self.lang_locked == "ru" else "Latvian"
+            messages_for_call.append({
+                "role": "system",
+                "content": f"Stick to {lang_name} only. Do not mix languages unless the user explicitly asks to switch.",
+            })
 
         def _run_sync(msgs):
             assistant_text = ""
@@ -567,6 +657,15 @@ class CallSession:
         if self.is_probable_echo(text):
             logger.info("Dropped probable echo: %r", text)
             return
+
+        lang_from_llm = await self._detect_lang_switch_via_llm(text)
+        if lang_from_llm and lang_from_llm != self.lang_locked:
+            self.lang_locked = lang_from_llm
+
+        if not self.lang_locked:
+            detected = self._detect_lang(text)
+            if detected:
+                self.lang_locked = detected
 
         async with self.llm_lock:
             logger.info("User utterance (final): %s", text)
