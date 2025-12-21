@@ -460,12 +460,15 @@ class CallSession:
         t = text.lower()
         has_cyr = any("а" <= ch <= "я" or ch == "ё" for ch in t)
         if has_cyr:
+            logger.info("Lang auto-detected by heuristic: ru")
             return "ru"
         latv_chars = set("āčēģīķļņšūž")
         if any(ch in latv_chars for ch in t):
+            logger.info("Lang auto-detected by heuristic: lv (Latvian diacritics)")
             return "lv"
         has_ascii = any(ch.isalpha() and ch.isascii() for ch in t)
         if has_ascii:
+            logger.info("Lang auto-detected by heuristic: lv (ASCII letters)")
             return "lv"
         return None
 
@@ -534,6 +537,7 @@ class CallSession:
                 continue
             lang = args.get("language")
             if lang in ("ru", "lv"):
+                logger.info("Lang switch requested via tool_call: %s", lang)
                 return lang
         return None
 
@@ -676,11 +680,13 @@ class CallSession:
 
         lang_from_llm = await self._detect_lang_switch_via_llm(text)
         if lang_from_llm and lang_from_llm != self.lang_locked:
+            logger.info("Lang changed by user request: %s", lang_from_llm)
             self.lang_locked = lang_from_llm
 
         if not self.lang_locked:
             detected = self._detect_lang(text)
             if detected:
+                logger.info("Lang locked from first detection: %s", detected)
                 self.lang_locked = detected
 
         async with self.llm_lock:
