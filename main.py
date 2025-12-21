@@ -494,7 +494,7 @@ class CallSession:
                 messages=messages,
                 tools=[tool],
                 tool_choice="auto",
-                max_completion_tokens=16,
+                max_completion_tokens=32,
                 temperature=0.0,
                 reasoning_effort="none",
                 verbosity="low",
