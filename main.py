@@ -191,7 +191,7 @@ class SttSession:
             "num_channels": 1,
             "enable_language_identification": True,
             "language_hints": ["ru", "lv"],
-            "enable_endpoint_detection": True, #TODO:Luche postavitj False
+            "enable_endpoint_detection": False,
             "client_reference_id": "twilio-call",
         }
         await self.ws.send(json.dumps(config_msg))
@@ -549,7 +549,7 @@ class CallSession:
         Если давно не приходили токены и есть накопленный текст — шлём Soniox {"type":"finalize"}.
         Без endpoint detection это заменяет ожидание <end>.
         """
-        IDLE_SECS = 0.9          # можно тюнить
+        IDLE_SECS = 0.5          # окно тишины перед finalize
         MIN_INTERVAL_SECS = 2.0  # чтобы не флудить finalize (Soniox не рекомендует слишком часто)
 
         while not self._finished:
@@ -733,6 +733,8 @@ class CallSession:
             logger.info("Soniox partial: %s", partial_text)
 
         # перебираем токены
+        self._last_stt_activity_ts = self.loop.time()
+        any_final = False
         for t in tokens:
             txt = t.get("text", "") or ""
             if not txt:
@@ -760,6 +762,7 @@ class CallSession:
                 final = self.user_utterance.strip()
                 logger.info("Soniox END token received, final user text: '%s'", final)
                 self.user_utterance = ""
+                self._finalize_inflight = False
 
                 if final:
                     self._turn_buf = (self._turn_buf + " " + final).strip() if self._turn_buf else final
@@ -770,6 +773,16 @@ class CallSession:
             # --- накапливаем только финальные токены в текущую реплику пользователя ---
             if t.get("is_final"):
                 self.user_utterance += txt
+                any_final = True
+
+        # Если финализацию запросили вручную (тишина) — сразу отправляем фразу дальше
+        if any_final and self._finalize_inflight:
+            final = self.user_utterance.strip()
+            self.user_utterance = ""
+            self._finalize_inflight = False
+            self._turn_buf = ""
+            if final:
+                asyncio.create_task(self.handle_user_utterance(final))
 
     async def twilio_loop(self):
         """Читаем события Twilio и шлём аудио в Soniox."""
@@ -918,7 +931,7 @@ class CallSession:
             await asyncio.gather(
                 self.twilio_loop(),
                 self.stt_loop(),
-                # self.stt_segmenter_loop(),
+                self.stt_segmenter_loop(),
                 self.stt_keepalive_loop(),
             )
         finally:
