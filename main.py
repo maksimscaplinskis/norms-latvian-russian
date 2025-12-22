@@ -8,7 +8,8 @@ from starlette.websockets import WebSocketDisconnect
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -101,8 +102,8 @@ def build_services():
     )
 
     llm = OpenAILLMService(model=OPENAI_MODEL)
-    context = OpenAILLMContext.from_messages([{"role": "system", "content": SYSTEM_PROMPT}])
-    aggregators = llm.create_context_aggregator(context)
+    context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
+    context_aggregator = LLMContextAggregatorPair(context)
 
     class LoggingElevenLabsTTSService(ElevenLabsTTSService):
         async def run_tts(self, text: str):
@@ -124,7 +125,7 @@ def build_services():
         sample_rate=PIPELINE_SAMPLE_RATE,
     )
 
-    return stt, llm, aggregators, tts
+    return stt, llm, context_aggregator, tts
 
 
 class FrameLogObserver(BaseObserver):
@@ -149,19 +150,17 @@ class FrameLogObserver(BaseObserver):
 def build_pipeline(
     transport: FastAPIWebsocketTransport,
 ) -> tuple[PipelineRunner, PipelineTask]:
-    stt, llm, aggregators, tts = build_services()
+    stt, llm, context_aggregator, tts = build_services()
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            aggregators.user(),
-            llm,
-            aggregators.assistant(),
-            tts,
-            transport.output(),
-        ]
-    )
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        transport.output(),
+        context_aggregator.assistant(),
+    ])
 
     params = PipelineParams(
         audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
