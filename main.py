@@ -72,7 +72,8 @@ SYSTEM_PROMPT = (
     1) If reason is unknown: ask the reason. If already stated, do not ask again.
     2) If caller asks only for info (address/hours/services/prices): answer briefly AND in the same sentence gently offer a visit.
     3) If reason is known and booking not offered yet: offer a visit with one question.
-    If caller asks to book at any time: go to booking steps immediately (no re-offer).
+    If caller asks to book at any time: go to booking steps (no re-offer).
+    - IMPORTANT: You must collect the visit reason. If the caller did NOT state a reason, ask for it once BEFORE booking and offering time options.
     4) Booking steps:
     a) Ask first name + last name.
     b) Ask desired date.
@@ -80,22 +81,6 @@ SYSTEM_PROMPT = (
     d) If chosen time is taken: offer another time same date.
     e) If no times on that date: offer the nearest next available date/time.
     5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
-
-    BOOKING LOGIC (highest priority)
-    - If the caller asks to book immediately, never ask “do you want to book?” — start booking.
-    - IMPORTANT: You must collect the visit reason at some point.
-    If the caller did NOT state a reason, ask for it once BEFORE offering time options or BEFORE final confirmation.
-
-    FLOW (one question per turn)
-    A) If caller asks to book in the first phrase:
-        1) If reason is still unknown: ask the reason (mandatory).
-        2) Ask first name + last name.
-        4) Offer date and 2 time options within 08:00–16:00 and ask which fits.
-        5) Closing: confirm date, time, reason, “AM Dental Studio”, end politely.
-    B) Otherwise (normal):
-        1) If reason unknown: ask the reason.
-        2) If caller asks only for info: answer + gently offer a visit.
-        3) If booking agreed: continue booking steps (name → date → time → closing).
 
     SAFETY
     If severe swelling, breathing difficulty, or uncontrolled bleeding: say to call emergency (112).
@@ -455,6 +440,13 @@ class CallSession:
         s = s.lower().strip()
         s = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in s)
         return " ".join(s.split())
+    
+    async def _stop_stt(self):
+        self._finished = True
+        try:
+            await self.stt.close()
+        except Exception:
+            pass
 
     def _detect_lang(self, text: str) -> str | None:
         t = text.lower()
@@ -465,10 +457,6 @@ class CallSession:
         latv_chars = set("āčēģīķļņšūž")
         if any(ch in latv_chars for ch in t):
             logger.info("Lang auto-detected by heuristic: lv (Latvian diacritics)")
-            return "lv"
-        has_ascii = any(ch.isalpha() and ch.isascii() for ch in t)
-        if has_ascii:
-            logger.info("Lang auto-detected by heuristic: lv (ASCII letters)")
             return "lv"
         return None
 
@@ -666,17 +654,17 @@ class CallSession:
         if not text:
             return
 
-        # короткое эхо: "Labdien", "Jā" часто приходит как подстрока последнего TTS
-        a = self._norm(text)
-        b = self._norm(self.last_tts_text)
-        if a and b and len(a) <= 12 and a in b:
-            logger.info("Dropped short echo-substring: %r (in last_tts=%r)", text, self.last_tts_text)
-            return
+        # анти-эхо: для финализированных сегментов (после <end>/finalize) — не дропаем
+        if not self._finalize_inflight:
+            a = self._norm(text)
+            b = self._norm(self.last_tts_text)
+            if a and b and len(a) <= 12 and a in b:
+                logger.info("Dropped short echo-substring: %r (in last_tts=%r)", text, self.last_tts_text)
+                return
 
-        # анти-эхо по similarity
-        if self.is_probable_echo(text):
-            logger.info("Dropped probable echo: %r", text)
-            return
+            if self.is_probable_echo(text):
+                logger.info("Dropped probable echo: %r", text)
+                return
 
         lang_from_llm = await self._detect_lang_switch_via_llm(text)
         if lang_from_llm and lang_from_llm != self.lang_locked:
@@ -688,6 +676,14 @@ class CallSession:
             if detected:
                 logger.info("Lang locked from first detection: %s", detected)
                 self.lang_locked = detected
+        else:
+            # если язык залочен, но поступает другой алфавит — инициируем switch через LLM
+            detected = self._detect_lang(text)
+            if detected and detected != self.lang_locked:
+                lang_from_llm = await self._detect_lang_switch_via_llm(text)
+                if lang_from_llm and lang_from_llm != self.lang_locked:
+                    logger.info("Lang changed by heuristic+tool: %s", lang_from_llm)
+                    self.lang_locked = lang_from_llm
 
         async with self.llm_lock:
             logger.info("User utterance (final): %s", text)
@@ -713,11 +709,8 @@ class CallSession:
     async def handle_stt_response(self, resp: dict):
         # ошибки Soniox
         if resp.get("error_code"):
-            logger.error(
-                "Soniox error %s: %s",
-                resp.get("error_code"),
-                resp.get("error_message"),
-            )
+            logger.error("Soniox error %s: %s", resp.get("error_code"), resp.get("error_message"))
+            await self._stop_stt()
             return
 
         tokens = resp.get("tokens", [])
@@ -739,6 +732,9 @@ class CallSession:
             logger.info("Soniox partial: %s", partial_text)
 
         # перебираем токены
+        self._last_stt_activity_ts = self.loop.time()
+        any_final = False
+        ended = False
         for t in tokens:
             txt = t.get("text", "") or ""
             if not txt:
@@ -766,21 +762,35 @@ class CallSession:
                 final = self.user_utterance.strip()
                 logger.info("Soniox END token received, final user text: '%s'", final)
                 self.user_utterance = ""
+                self._finalize_inflight = False
+                ended = True
+                self._turn_buf = ""
 
                 if final:
-                    self._turn_buf = (self._turn_buf + " " + final).strip() if self._turn_buf else final
-                    self._arm_turn_flush()
+                    asyncio.create_task(self.handle_user_utterance(final))
 
                 continue
 
             # --- накапливаем только финальные токены в текущую реплику пользователя ---
             if t.get("is_final"):
                 self.user_utterance += txt
+                any_final = True
+
+        # Если финализацию запросили вручную (тишина) — сразу отправляем фразу дальше
+        if any_final and self._finalize_inflight and (not ended):
+            final = self.user_utterance.strip()
+            self.user_utterance = ""
+            self._finalize_inflight = False
+            self._turn_buf = ""
+            if final:
+                asyncio.create_task(self.handle_user_utterance(final))
 
     async def twilio_loop(self):
         """Читаем события Twilio и шлём аудио в Soniox."""
         try:
             while True:
+                if self._finished:
+                    break
                 msg = await self.ws.receive_text()
                 data = json.loads(msg)
                 event = data.get("event")
@@ -882,6 +892,7 @@ class CallSession:
                 elif event == "stop":
                     logger.info("Twilio stream STOP received")
                     await self.stt.finalize()
+                    await self._stop_stt()
                     break
 
                 else:
@@ -890,9 +901,11 @@ class CallSession:
         except WebSocketDisconnect:
             logger.info("Twilio WebSocket disconnected")
             await self.stt.finalize()
+            await self._stop_stt()
         except Exception as e:
             logger.exception("Error in twilio_loop: %s", e)
             await self.stt.finalize()
+            await self._stop_stt()
 
     async def stt_keepalive_loop(self):
         while not self._finished:
