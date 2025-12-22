@@ -156,11 +156,12 @@ async def twilio_voice(
     host = request.url.hostname or "localhost"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Connect>
-            <Stream url="wss://{host}/twilio-stream" track="both_tracks" />
-        </Connect>
-    </Response>"""
+<Response>
+    <Start>
+        <Stream url="wss://{host}/twilio-stream" track="both_tracks" />
+    </Start>
+    <Pause length="60" />
+</Response>"""
 
     return Response(content=twiml.strip(), media_type="text/xml")
 
