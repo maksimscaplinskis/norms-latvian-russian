@@ -6,3 +6,4 @@ elevenlabs
 websockets
 httpx
 python-multipart
+pipecat-ai

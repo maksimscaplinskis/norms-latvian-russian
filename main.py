@@ -1,166 +1,143 @@
 import os
-import json
-import base64
 import logging
-import asyncio
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
 from starlette.websockets import WebSocketDisconnect
 
-import websockets
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
+from pipecat.transcriptions.language import Language
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("twilio-soniox")
+logger = logging.getLogger("twilio-pipecat")
+
+app = FastAPI()
+
+PIPELINE_SAMPLE_RATE = 8000
 
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 SONIOX_MODEL = os.getenv("SONIOX_MODEL", "stt-rt-v3")
 
-app = FastAPI()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+
+SYSTEM_PROMPT = """
+You are a bilingual (Russian/Latvian) phone agent for a dental clinic. Keep replies concise (1–2 sentences) and stay in the caller's language (Russian if caller speaks Russian, Latvian if caller speaks Latvian). Do not mix languages in one answer. Collect the visit reason and offer to book. If caller asks for address/hours/services, answer briefly and offer to book. If emergency (heavy bleeding, trouble breathing, strong swelling), say to call emergency number 112.
+""".strip()
 
 
-class SttSession:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.ws: websockets.WebSocketClientProtocol | None = None
-
-    async def connect(self):
-        if not self.api_key:
-            raise RuntimeError("SONIOX_API_KEY is not set")
-
-        self.ws = await websockets.connect(
-            "wss://stt-rt.soniox.com/transcribe-websocket"
-        )
-        logger.info("Connected to Soniox WebSocket")
-
-        config_msg = {
-            "api_key": self.api_key,
-            "model": SONIOX_MODEL,
-            "audio_format": "mulaw",
-            "sample_rate": 8000,
-            "num_channels": 1,
-            "enable_language_identification": True,
-            "language_hints": ["en","ru","lv"],
-            "enable_endpoint_detection": True,
-            "client_reference_id": "twilio-call",
-        }
-        await self.ws.send(json.dumps(config_msg))
-        logger.info("Sent Soniox config")
-
-    async def send_audio(self, audio_bytes: bytes):
-        if self.ws:
-            await self.ws.send(audio_bytes)
-
-    async def receive_loop(self, handler):
-        if not self.ws:
-            return
-        try:
-            async for message in self.ws:
-                try:
-                    resp = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning("Non-JSON Soniox message: %r", message)
-                    continue
-                await handler(resp)
-        except Exception as e:
-            logger.exception("Error in SttSession.receive_loop: %s", e)
-
-    async def finalize(self):
-        if self.ws:
-            try:
-                await self.ws.send(b"")
-            except Exception:
-                pass
-
-    async def close(self):
-        if self.ws:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-            self.ws = None
+def twilio_serializer_params() -> TwilioFrameSerializer.InputParams:
+    """
+    Build serializer params to keep Twilio audio at 8kHz and avoid forced hangup
+    if Twilio creds are not present.
+    """
+    auto_hang_up = bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"))
+    return TwilioFrameSerializer.InputParams(
+        twilio_sample_rate=PIPELINE_SAMPLE_RATE,
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        auto_hang_up=auto_hang_up,
+    )
 
 
-class CallSession:
-    def __init__(self, ws: WebSocket):
-        self.ws = ws
-        self.stt = SttSession(SONIOX_API_KEY)
-        self._finished = False
+async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
+    transport_type, call_data = await parse_telephony_websocket(websocket)
+    if transport_type != "twilio":
+        raise RuntimeError(f"Unsupported transport type: {transport_type}")
 
-    async def handle_stt_response(self, resp: dict):
-        tokens = resp.get("tokens", [])
-        if not tokens:
-            if resp.get("finished"):
-                logger.info(
-                    "Soniox finished: final_audio_proc_ms=%s total_audio_proc_ms=%s",
-                    resp.get("final_audio_proc_ms"),
-                    resp.get("total_audio_proc_ms"),
-                )
-                self._finished = True
-            return
+    serializer = TwilioFrameSerializer(
+        stream_sid=call_data["stream_id"],
+        call_sid=call_data["call_id"],
+        account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
+        auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+        params=twilio_serializer_params(),
+    )
 
-        partial = "".join(t.get("text", "") for t in tokens if not t.get("is_final"))
-        final = "".join(t.get("text", "") for t in tokens if t.get("is_final"))
+    params = FastAPIWebsocketParams(
+        serializer=serializer,
+        add_wav_header=False,
+        session_timeout=None,
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+        audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
+        audio_out_channels=1,
+        audio_in_channels=1,
+    )
 
-        if partial.strip():
-            logger.info("Soniox partial: %s", partial.strip())
-        if final.strip():
-            logger.info("Soniox final: %s", final.strip())
+    return FastAPIWebsocketTransport(websocket=websocket, params=params)
 
-    async def twilio_loop(self):
-        try:
-            while True:
-                msg = await self.ws.receive_text()
-                data = json.loads(msg)
-                event = data.get("event")
 
-                if event == "connected":
-                    logger.info("Twilio event=connected")
+def build_services():
+    if not SONIOX_API_KEY:
+        raise RuntimeError("SONIOX_API_KEY is not set")
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        raise RuntimeError("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID is not set")
 
-                elif event == "start":
-                    start = data.get("start", {})
-                    stream_sid = start.get("streamSid")
-                    logger.info("Twilio stream START: %s", stream_sid)
+    stt = SonioxSTTService(
+        api_key=SONIOX_API_KEY,
+        sample_rate=PIPELINE_SAMPLE_RATE,
+        params=SonioxInputParams(
+            model=SONIOX_MODEL,
+            audio_format="pcm_s16le",
+            num_channels=1,
+            language_hints=[Language.RU, Language.LV],
+            enable_language_identification=True,
+            client_reference_id="twilio-pipecat",
+        ),
+    )
 
-                elif event == "media":
-                    payload_b64 = (data.get("media") or {}).get("payload")
-                    if not payload_b64:
-                        continue
-                    audio_bytes = base64.b64decode(payload_b64)
-                    await self.stt.send_audio(audio_bytes)
+    llm = OpenAILLMService(model=OPENAI_MODEL)
+    context = OpenAILLMContext.from_messages([{"role": "system", "content": SYSTEM_PROMPT}])
+    aggregators = llm.create_context_aggregator(context)
 
-                elif event == "stop":
-                    logger.info("Twilio stream STOP received")
-                    await self.stt.finalize()
-                    break
+    tts = ElevenLabsTTSService(
+        api_key=ELEVENLABS_API_KEY,
+        voice_id=ELEVENLABS_VOICE_ID,
+        model=ELEVENLABS_MODEL_ID,
+        sample_rate=PIPELINE_SAMPLE_RATE,
+    )
 
-                else:
-                    logger.debug("Unhandled Twilio event: %s", event)
+    return stt, llm, aggregators, tts
 
-        except WebSocketDisconnect:
-            logger.info("Twilio WebSocket disconnected")
-        except Exception as e:
-            logger.exception("Error in twilio_loop: %s", e)
 
-    async def run(self):
-        try:
-            await self.stt.connect()
-        except Exception as e:
-            logger.exception("Cannot start SttSession: %s", e)
-            await self.ws.close()
-            return
+def build_pipeline(
+    transport: FastAPIWebsocketTransport,
+) -> tuple[PipelineRunner, PipelineTask]:
+    stt, llm, aggregators, tts = build_services()
 
-        try:
-            await asyncio.gather(
-                self.twilio_loop(),
-                self.stt.receive_loop(self.handle_stt_response),
-            )
-        finally:
-            await self.stt.close()
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            aggregators.user(),
+            llm,
+            aggregators.assistant(),
+            tts,
+            transport.output(),
+        ]
+    )
+
+    params = PipelineParams(
+        audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+        audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
+        enable_heartbeats=False,
+    )
+
+    task = PipelineTask(pipeline, params=params)
+    runner = PipelineRunner(handle_sigint=False, handle_sigterm=False)
+    return runner, task
 
 
 @app.get("/health")
@@ -176,13 +153,12 @@ async def twilio_voice(
     To: str = Form(None),
 ):
     logger.info("Incoming call: CallSid=%s, From=%s, To=%s", CallSid, From, To)
-
     host = request.url.hostname or "localhost"
 
-    twiml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Connect>
-            <Stream url=\"wss://{host}/twilio-stream\" />
+            <Stream url="wss://{host}/twilio-stream" />
         </Connect>
     </Response>"""
 
@@ -193,6 +169,28 @@ async def twilio_voice(
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
     logger.info("Twilio WebSocket connected")
-    session = CallSession(ws)
-    await session.run()
-    logger.info("twilio_stream handler finished")
+
+    try:
+        transport = await build_transport(ws)
+        runner, task = build_pipeline(transport)
+    except Exception as e:
+        logger.exception("Failed to initialize pipeline: %s", e)
+        await ws.close()
+        return
+
+    try:
+        await runner.run(task)
+    except WebSocketDisconnect:
+        logger.info("Twilio WebSocket disconnected")
+    except Exception as e:
+        logger.exception("Error while running pipeline: %s", e)
+        try:
+            await task.cancel(reason=str(e))
+        except Exception:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        logger.info("twilio_stream handler finished")
