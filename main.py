@@ -187,14 +187,20 @@ async def twilio_voice(
     To: str = Form(None),
 ):
     logger.info("Incoming call: CallSid=%s, From=%s, To=%s", CallSid, From, To)
-    host = request.url.hostname or "localhost"
+
+    # Важно: host должен быть публичным (ngrok/домен), с портом если он есть
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.hostname
+        or "localhost"
+    )
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Start>
-        <Stream url="wss://{host}/twilio-stream" track="both_tracks" />
-    </Start>
-    <Pause length="60" />
+  <Connect>
+    <Stream url="wss://{host}/twilio-stream"/>
+  </Connect>
 </Response>"""
 
     return Response(content=twiml.strip(), media_type="text/xml")
