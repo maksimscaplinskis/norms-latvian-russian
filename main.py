@@ -16,11 +16,7 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.frames.frames import (
-    OutputAudioRawFrame,
-    OutputTransportMessageFrame,
-    OutputTransportMessageUrgentFrame,
-)
+from pipecat.frames.frames import TTSAudioRawFrame, TTSStoppedFrame
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio-pipecat")
@@ -56,36 +52,12 @@ def twilio_serializer_params() -> TwilioFrameSerializer.InputParams:
     )
 
 
-class LoggingTwilioFrameSerializer(TwilioFrameSerializer):
-    """Twilio serializer with explicit logs on media/mark out and media in."""
-
-    async def serialize(self, frame):
-        if isinstance(frame, OutputAudioRawFrame):
-            logger.info("Twilio OUT media: %d bytes @%sHz", len(frame.audio), frame.sample_rate)
-        elif isinstance(frame, (OutputTransportMessageFrame, OutputTransportMessageUrgentFrame)):
-            mark = getattr(frame, "mark", None)
-            logger.info("Twilio OUT transport message: %s", mark)
-        return await super().serialize(frame)
-
-    async def deserialize(self, data):
-        # data is raw WS payload (bytes/str depending on serializer)
-        try:
-            text = data if isinstance(data, str) else data.decode("utf-8", errors="ignore")
-        except Exception:
-            text = "<non-text>"
-        if isinstance(text, str) and '"event":"media"' in text:
-            logger.info("Twilio IN media payload received (len=%d)", len(text))
-        elif isinstance(text, str) and '"event":"mark"' in text:
-            logger.info("Twilio IN mark: %s", text)
-        return await super().deserialize(data)
-
-
 async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
     transport_type, call_data = await parse_telephony_websocket(websocket)
     if transport_type != "twilio":
         raise RuntimeError(f"Unsupported transport type: {transport_type}")
 
-    serializer = LoggingTwilioFrameSerializer(
+    serializer = TwilioFrameSerializer(
         stream_sid=call_data["stream_id"],
         call_sid=call_data["call_id"],
         account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
@@ -131,7 +103,20 @@ def build_services():
     context = OpenAILLMContext.from_messages([{"role": "system", "content": SYSTEM_PROMPT}])
     aggregators = llm.create_context_aggregator(context)
 
-    tts = ElevenLabsTTSService(
+    class LoggingElevenLabsTTSService(ElevenLabsTTSService):
+        async def run_tts(self, text: str):
+            logger.info("GPT reply -> TTS: %s", text)
+            started = False
+            try:
+                async for frame in super().run_tts(text):
+                    if isinstance(frame, TTSAudioRawFrame) and not started:
+                        logger.info("ElevenLabs started streaming audio")
+                        started = True
+                    yield frame
+            finally:
+                logger.info("ElevenLabs finished for text")
+
+    tts = LoggingElevenLabsTTSService(
         api_key=ELEVENLABS_API_KEY,
         voice_id=ELEVENLABS_VOICE_ID,
         model=ELEVENLABS_MODEL_ID,
