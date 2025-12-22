@@ -16,7 +16,8 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.frames.frames import TTSAudioRawFrame, TTSStoppedFrame
+from pipecat.frames.frames import LLMTextFrame, TTSAudioRawFrame, TTSStoppedFrame
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio-pipecat")
@@ -126,6 +127,25 @@ def build_services():
     return stt, llm, aggregators, tts
 
 
+class FrameLogObserver(BaseObserver):
+    """Logs key frames for GPT reply and TTS lifecycle."""
+
+    def __init__(self):
+        super().__init__()
+        self._tts_started = False
+
+    async def on_push_frame(self, data: FramePushed):
+        frame = data.frame
+        if isinstance(frame, LLMTextFrame):
+            logger.info("GPT reply frame: %s", getattr(frame, "text", ""))
+        if isinstance(frame, TTSAudioRawFrame) and not self._tts_started:
+            self._tts_started = True
+            logger.info("ElevenLabs started streaming audio (first chunk %d bytes)", len(frame.audio))
+        if isinstance(frame, TTSStoppedFrame):
+            logger.info("ElevenLabs finished (TTSStoppedFrame)")
+            self._tts_started = False
+
+
 def build_pipeline(
     transport: FastAPIWebsocketTransport,
 ) -> tuple[PipelineRunner, PipelineTask]:
@@ -149,7 +169,7 @@ def build_pipeline(
         enable_heartbeats=False,
     )
 
-    task = PipelineTask(pipeline, params=params)
+    task = PipelineTask(pipeline, params=params, observers=[FrameLogObserver()])
     runner = PipelineRunner(handle_sigint=False, handle_sigterm=False)
     return runner, task
 
