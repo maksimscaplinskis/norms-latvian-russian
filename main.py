@@ -158,7 +158,7 @@ async def twilio_voice(
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Connect>
-            <Stream url="wss://{host}/twilio-stream" />
+            <Stream url="wss://{host}/twilio-stream" track="both_tracks" />
         </Connect>
     </Response>"""
 
