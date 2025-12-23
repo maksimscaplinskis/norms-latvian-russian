@@ -185,7 +185,7 @@ def build_pipeline(
         audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         enable_heartbeats=False,
         allow_interruptions=True,
-        interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)],
+        # interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)],
     )
 
     task = PipelineTask(pipeline, params=params, observers=[FrameLogObserver()])
