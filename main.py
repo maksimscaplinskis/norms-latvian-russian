@@ -28,7 +28,7 @@ from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
 
 import re
 
-INTRO_LV = "Labdien, A. M. Dental Studio. Kā varu palīdzēt?"
+INTRO_LV = "Labdien, AM Dental Studio, kā varu palīdzēt?"
 
 CYR = re.compile(r"[А-Яа-яЁё]")
 
@@ -57,7 +57,7 @@ GOOGLE_TTS_VOICE_LV = os.getenv("GOOGLE_TTS_VOICE_LV", "lv-LV-Chirp3-HD-Algenib"
 GOOGLE_TTS_VOICE_RU = os.getenv("GOOGLE_TTS_VOICE_RU", "ru-RU-Chirp3-HD-Algenib")
 
 SYSTEM_PROMPT = """
-    You are the AI VOICE receptionist for A. M. Dental Studio, a dental clinic.
+    You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
 
     GOAL
     Understand the caller’s need and, when appropriate, book a visit.
