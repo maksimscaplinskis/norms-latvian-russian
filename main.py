@@ -168,11 +168,11 @@ def build_services():
         model=OPENAI_MODEL,
         params=BaseOpenAILLMService.InputParams(
             max_completion_tokens=96,
-            # temperature=0.2,
-            # top_p=1.0,
+            temperature=0.2,
+            top_p=1.0,
             seed=42,                   # опционально: детерминизм
             extra={
-                "reasoning_effort": "low",
+                "reasoning_effort": "none",
                 "verbosity": "low",
             },
         ),
