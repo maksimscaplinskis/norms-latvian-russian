@@ -24,8 +24,11 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
+from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
 
 import re
+
+INTRO_LV = "Labdien, AM Dental Studio. Kā varu palīdzēt?"
 
 CYR = re.compile(r"[А-Яа-яЁё]")
 
@@ -45,8 +48,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 
-GOOGLE_TTS_VOICE_LV = os.getenv("GOOGLE_TTS_VOICE_LV", "lv-LV-Chirp3-HD-Achernar")
-GOOGLE_TTS_VOICE_RU = os.getenv("GOOGLE_TTS_VOICE_RU", "ru-RU-Chirp3-HD-Achernar")
+GOOGLE_TTS_VOICE_LV = os.getenv("GOOGLE_TTS_VOICE_LV", "lv-LV-Chirp3-HD-Algenib")
+GOOGLE_TTS_VOICE_RU = os.getenv("GOOGLE_TTS_VOICE_RU", "ru-RU-Chirp3-HD-Algenib")
 
 SYSTEM_PROMPT = """
     You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
@@ -209,7 +212,7 @@ def build_services():
         voice_lv=GOOGLE_TTS_VOICE_LV,
         voice_ru=GOOGLE_TTS_VOICE_RU,
         sample_rate=PIPELINE_SAMPLE_RATE,
-        params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=1.0),
+        params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=1.1),
     )
 
     return stt, llm, context_aggregator, tts
@@ -221,13 +224,12 @@ class LoggingGoogleTTSService(GoogleTTSService):
         self.voice_ru = voice_ru
 
     async def run_tts(self, text: str):
-        # выбор голоса перед синтезом
         if CYR.search(text):
             self.set_voice(self.voice_ru)
-            await self._update_settings({"language": self.language_to_service_language(Language.RU)})
+            await self._update_settings({"language": Language.RU})
         else:
             self.set_voice(self.voice_lv)
-            await self._update_settings({"language": self.language_to_service_language(Language.LV)})
+            await self._update_settings({"language": Language.LV})
 
         logger.info("GPT reply -> Google TTS: %s", text)
 
@@ -282,6 +284,14 @@ def build_pipeline(
 
     task = PipelineTask(pipeline, params=params, observers=[FrameLogObserver()])
     runner = PipelineRunner(handle_sigint=False, handle_sigterm=False)
+
+    @transport.event_handler("on_client_connected")
+    async def _on_client_connected(_transport, _client):
+        await task.queue_frames([
+            TTSUpdateSettingsFrame({"language": Language.LV}),
+            TTSSpeakFrame(INTRO_LV),
+        ])
+
     return runner, task
 
 
