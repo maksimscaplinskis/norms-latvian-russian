@@ -102,9 +102,9 @@ SYSTEM_PROMPT = """
 """.strip()
 
 vad_params = VADParams(
-    confidence=0.6,   # стартуйте с 0.6-0.75
-    start_secs=0.2,   # сколько речи нужно, чтобы считать "начал говорить"
-    stop_secs=0.4,    # сколько тишины, чтобы считать "закончил"
+    confidence=0.7,   # стартуйте с 0.6-0.75
+    start_secs=0.25,   # сколько речи нужно, чтобы считать "начал говорить"
+    stop_secs=0.5,    # сколько тишины, чтобы считать "закончил"
     min_volume=0.5,   # полезно на телефонии
 )
 
@@ -212,7 +212,7 @@ def build_services():
         voice_lv=GOOGLE_TTS_VOICE_LV,
         voice_ru=GOOGLE_TTS_VOICE_RU,
         sample_rate=PIPELINE_SAMPLE_RATE,
-        params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=1.1),
+        params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=0.9),
     )
 
     return stt, llm, context_aggregator, tts
