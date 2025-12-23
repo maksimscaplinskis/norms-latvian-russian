@@ -172,7 +172,7 @@ def build_services():
             top_p=1.0,
             seed=42,                   # опционально: детерминизм
             extra={
-                "reasoning_effort": "minimal",
+                "reasoning_effort": "low",
                 "verbosity": "low",
             },
         ),
