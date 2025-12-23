@@ -38,7 +38,7 @@ PIPELINE_SAMPLE_RATE = 8000
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 SONIOX_MODEL = os.getenv("SONIOX_MODEL", "stt-rt-v3")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
@@ -168,8 +168,8 @@ def build_services():
         model=OPENAI_MODEL,
         params=BaseOpenAILLMService.InputParams(
             max_completion_tokens=96,
-            temperature=0.2,
-            top_p=1.0,
+            # temperature=0.2,
+            # top_p=1.0,
             seed=42,                   # опционально: детерминизм
             extra={
                 "reasoning_effort": "low",
