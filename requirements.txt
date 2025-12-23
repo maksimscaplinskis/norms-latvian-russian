@@ -7,3 +7,4 @@ websockets
 httpx
 python-multipart
 pipecat-ai
+pipecat-ai[silero]
