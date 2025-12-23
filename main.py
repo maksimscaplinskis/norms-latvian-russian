@@ -19,6 +19,13 @@ from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.frames.frames import LLMTextFrame, TTSAudioRawFrame, TTSStoppedFrame
 from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
+
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio-pipecat")
@@ -40,6 +47,14 @@ SYSTEM_PROMPT = """
 You are a bilingual (Russian/Latvian) phone agent for a dental clinic. Keep replies concise (1–2 sentences) and stay in the caller's language (Russian if caller speaks Russian, Latvian if caller speaks Latvian). Do not mix languages in one answer. Collect the visit reason and offer to book. If caller asks for address/hours/services, answer briefly and offer to book. If emergency (heavy bleeding, trouble breathing, strong swelling), say to call emergency number 112.
 """.strip()
 
+vad_params = VADParams(
+    confidence=0.6,   # стартуйте с 0.6-0.75
+    start_secs=0.2,   # сколько речи нужно, чтобы считать "начал говорить"
+    stop_secs=0.4,    # сколько тишины, чтобы считать "закончил"
+    min_volume=0.5,   # полезно на телефонии
+)
+
+vad_analyzer = SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE, params=vad_params)
 
 def twilio_serializer_params() -> TwilioFrameSerializer.InputParams:
     """
@@ -77,6 +92,9 @@ async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
         audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         audio_out_channels=1,
         audio_in_channels=1,
+        vad_enabled=True,
+        vad_analyzer=vad_analyzer,
+        vad_audio_passthrough=True,
     )
 
     return FastAPIWebsocketTransport(websocket=websocket, params=params)
@@ -166,6 +184,8 @@ def build_pipeline(
         audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
         audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         enable_heartbeats=False,
+        allow_interruptions=True,
+        interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)],
     )
 
     task = PipelineTask(pipeline, params=params, observers=[FrameLogObserver()])
@@ -198,7 +218,7 @@ async def twilio_voice(
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://{host}/twilio-stream"/>
+    <Stream url="wss://{host}/twilio-stream" track="inbound_track"/>
   </Connect>
 </Response>"""
 
