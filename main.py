@@ -28,7 +28,7 @@ from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
 
 import re
 
-INTRO_LV = "Labdien, AM Dental Studio. Kā varu palīdzēt?"
+INTRO_LV = "Labdien, A. M. Dental Studio. Kā varu palīdzēt?"
 
 CYR = re.compile(r"[А-Яа-яЁё]")
 
@@ -37,7 +37,12 @@ logger = logging.getLogger("twilio-pipecat")
 
 app = FastAPI()
 
-PIPELINE_SAMPLE_RATE = 8000
+IN_SR = 8000
+OUT_SR = 24000
+
+PIPELINE_SAMPLE_RATE = IN_SR
+
+silence_80ms = b"\x00" * int(OUT_SR * 0.08 * 2)  # 2 bytes/sample (pcm16)
 
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 SONIOX_MODEL = os.getenv("SONIOX_MODEL", "stt-rt-v3")
@@ -52,7 +57,7 @@ GOOGLE_TTS_VOICE_LV = os.getenv("GOOGLE_TTS_VOICE_LV", "lv-LV-Chirp3-HD-Algenib"
 GOOGLE_TTS_VOICE_RU = os.getenv("GOOGLE_TTS_VOICE_RU", "ru-RU-Chirp3-HD-Algenib")
 
 SYSTEM_PROMPT = """
-    You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
+    You are the AI VOICE receptionist for A. M. Dental Studio, a dental clinic.
 
     GOAL
     Understand the caller’s need and, when appropriate, book a visit.
@@ -143,7 +148,7 @@ async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
         audio_in_enabled=True,
         audio_out_enabled=True,
         audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-        audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
+        audio_out_sample_rate=OUT_SR,
         audio_out_channels=1,
         audio_in_channels=1,
         vad_analyzer=vad_analyzer,
@@ -155,8 +160,8 @@ async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
 def build_services():
     if not SONIOX_API_KEY:
         raise RuntimeError("SONIOX_API_KEY is not set")
-    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-        raise RuntimeError("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID is not set")
+    # if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+    #     raise RuntimeError("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID is not set")
 
     stt = SonioxSTTService(
         api_key=SONIOX_API_KEY,
@@ -211,7 +216,7 @@ def build_services():
         credentials=os.environ["GCP_SA_JSON"],
         voice_lv=GOOGLE_TTS_VOICE_LV,
         voice_ru=GOOGLE_TTS_VOICE_RU,
-        sample_rate=PIPELINE_SAMPLE_RATE,
+        sample_rate=OUT_SR,
         params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=1),
     )
 
@@ -276,7 +281,7 @@ def build_pipeline(
 
     params = PipelineParams(
         audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-        audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
+        audio_out_sample_rate=OUT_SR,
         enable_heartbeats=False,
         allow_interruptions=True,
         # interruption_strategies=[MinWordsInterruptionStrategy(min_words=2)],
@@ -288,6 +293,7 @@ def build_pipeline(
     @transport.event_handler("on_client_connected")
     async def _on_client_connected(_transport, _client):
         await task.queue_frames([
+            TTSAudioRawFrame(silence_80ms, OUT_SR, 1),
             TTSUpdateSettingsFrame({"language": Language.LV}),
             TTSSpeakFrame(INTRO_LV),
         ])
