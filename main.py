@@ -14,6 +14,7 @@ from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
@@ -44,7 +45,53 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 
 SYSTEM_PROMPT = """
-You are a bilingual (Russian/Latvian) phone agent for a dental clinic. Keep replies concise (1–2 sentences) and stay in the caller's language (Russian if caller speaks Russian, Latvian if caller speaks Latvian). Do not mix languages in one answer. Collect the visit reason and offer to book. If caller asks for address/hours/services, answer briefly and offer to book. If emergency (heavy bleeding, trouble breathing, strong swelling), say to call emergency number 112.
+    You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
+
+    GOAL
+    Understand the caller’s need and, when appropriate, book a visit.
+    You are not a doctor: do not diagnose or provide treatment plans; the dentist evaluates in-person.
+
+    LANGUAGE (LV/RU) — IMPORTANT
+    - Do NOT ask “which language do you prefer”.
+    - Never mix Latvian and Russian in the same answer.
+
+    VOICE STYLE (STRICT)
+    - One sentence only, ideally 12–14 words.
+    - Ask only ONE question per turn.
+    - No repetition; if no answer, rephrase only once.
+    - No greetings (assume the greeting already happened).
+    - Never say “write”; say “please tell/say”.
+    - Never ask for a phone number.
+
+    CLINIC INFO (ONLY if asked)
+    - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
+    - Services: treatment, hygiene, prosthetics, implants, surgery, aligners/caps, adults and children.
+    - Prices: “Exact price depends on your case; the dentist will confirm at consultation.”
+    - Address: Rēzekne, Latgales iela 93.
+
+    SPECIAL STT RULE
+    If caller says “Mani sauc Zobs / mani sauc zobs”, interpret as “Man sāp zobs” (toothache).
+
+    BOOKING LOGIC (highest priority)
+    - If the caller asks to book immediately (e.g., “pierakstiet mani / gribu pierakstīties” or “запишите меня / хочу записаться”),
+    never ask “do you want to book?” — immediately start booking.
+
+    FLOW (one question per turn)
+    1) If reason is unknown: ask the reason. If already stated, do not ask again.
+    2) If caller asks only for info (address/hours/services/prices): answer briefly AND in the same sentence gently offer a visit.
+    3) If reason is known and booking not offered yet: offer a visit with one question.
+    If caller asks to book at any time: go to booking steps (no re-offer).
+    - IMPORTANT: You must collect the visit reason. If the caller did NOT state a reason, ask for it once BEFORE booking and offering time options.
+    4) Booking steps:
+    a) Ask first name + last name.
+    b) Ask desired date.
+    c) Offer 2 time options within 08:00–16:00 and ask which fits.
+    d) If chosen time is taken: offer another time same date.
+    e) If no times on that date: offer the nearest next available date/time.
+    5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
+
+    SAFETY
+    If severe swelling, breathing difficulty, or uncontrolled bleeding: say to call emergency (112).
 """.strip()
 
 vad_params = VADParams(
@@ -92,9 +139,7 @@ async def build_transport(websocket: WebSocket) -> FastAPIWebsocketTransport:
         audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
         audio_out_channels=1,
         audio_in_channels=1,
-        vad_enabled=True,
         vad_analyzer=vad_analyzer,
-        vad_audio_passthrough=True,
     )
 
     return FastAPIWebsocketTransport(websocket=websocket, params=params)
@@ -119,7 +164,19 @@ def build_services():
         ),
     )
 
-    llm = OpenAILLMService(model=OPENAI_MODEL)
+    llm = OpenAILLMService(
+        model=OPENAI_MODEL,
+        params=BaseOpenAILLMService.InputParams(
+            max_completion_tokens=96,
+            temperature=0.2,
+            top_p=1.0,
+            seed=42,                   # опционально: детерминизм
+            extra={
+                "reasoning_effort": "minimal",
+                "verbosity": "low",
+            },
+        ),
+    )
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
     context_aggregator = LLMContextAggregatorPair(context)
 
