@@ -8,3 +8,4 @@ httpx
 python-multipart
 pipecat-ai
 pipecat-ai[silero]
+pipecat-ai[google]

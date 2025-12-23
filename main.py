@@ -13,6 +13,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.google.tts import GoogleTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
@@ -24,9 +25,9 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
 
-import sys
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
+import re
+
+CYR = re.compile(r"[А-Яа-яЁё]")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio-pipecat")
@@ -43,6 +44,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+
+GOOGLE_TTS_VOICE_LV = os.getenv("GOOGLE_TTS_VOICE_LV", "lv-LV-Chirp3-HD-Achernar")
+GOOGLE_TTS_VOICE_RU = os.getenv("GOOGLE_TTS_VOICE_RU", "ru-RU-Chirp3-HD-Achernar")
 
 SYSTEM_PROMPT = """
     You are the AI VOICE receptionist for AM Dental Studio, a dental clinic.
@@ -193,15 +197,47 @@ def build_services():
             finally:
                 logger.info("ElevenLabs finished for text")
 
-    tts = LoggingElevenLabsTTSService(
-        api_key=ELEVENLABS_API_KEY,
-        voice_id=ELEVENLABS_VOICE_ID,
-        model=ELEVENLABS_MODEL_ID,
+    # tts = LoggingElevenLabsTTSService(
+    #     api_key=ELEVENLABS_API_KEY,
+    #     voice_id=ELEVENLABS_VOICE_ID,
+    #     model=ELEVENLABS_MODEL_ID,
+    #     sample_rate=PIPELINE_SAMPLE_RATE,
+    # )
+
+    tts = LoggingGoogleTTSService(
+        credentials=os.environ["GCP_SA_JSON"],
+        voice_lv=GOOGLE_TTS_VOICE_LV,
+        voice_ru=GOOGLE_TTS_VOICE_RU,
         sample_rate=PIPELINE_SAMPLE_RATE,
+        params=GoogleTTSService.InputParams(language=Language.LV, speaking_rate=1.0),
     )
 
     return stt, llm, context_aggregator, tts
 
+class LoggingGoogleTTSService(GoogleTTSService):
+    def __init__(self, *, voice_lv: str, voice_ru: str, **kwargs):
+        super().__init__(voice_id=voice_lv, **kwargs)
+        self.voice_lv = voice_lv
+        self.voice_ru = voice_ru
+
+    async def run_tts(self, text: str):
+        # выбор голоса перед синтезом
+        if CYR.search(text):
+            self.set_voice(self.voice_ru)
+            await self._update_settings({"language": self.language_to_service_language(Language.RU)})
+        else:
+            self.set_voice(self.voice_lv)
+            await self._update_settings({"language": self.language_to_service_language(Language.LV)})
+
+        logger.info("GPT reply -> Google TTS: %s", text)
+
+        started = False
+        async for frame in super().run_tts(text):
+            if isinstance(frame, TTSAudioRawFrame) and not started:
+                logger.info("Google TTS started streaming audio")
+                started = True
+            yield frame
+        logger.info("Google TTS finished for text")
 
 class FrameLogObserver(BaseObserver):
     """Logs key frames for GPT reply and TTS lifecycle."""
@@ -220,7 +256,6 @@ class FrameLogObserver(BaseObserver):
         if isinstance(frame, TTSStoppedFrame):
             logger.info("ElevenLabs finished (TTSStoppedFrame)")
             self._tts_started = False
-
 
 def build_pipeline(
     transport: FastAPIWebsocketTransport,
