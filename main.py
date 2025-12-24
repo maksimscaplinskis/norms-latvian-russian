@@ -224,7 +224,12 @@ def build_services():
     return stt, llm, context_aggregator, tts
 
 class LoggingGoogleTTSService(GoogleTTSService):
-    CHUNK_SECONDS = float(os.getenv("GOOGLE_TTS_CHUNK_SECONDS", "1.0"))
+    @property
+    def chunk_size(self) -> int:
+        chunk_seconds = float(os.getenv("GOOGLE_TTS_CHUNK_SECONDS", "1.0"))
+        # sample_rate становится >0 после start(); до этого можно опереться на _init_sample_rate
+        sr = self.sample_rate or getattr(self, "_init_sample_rate", 0) or OUT_SR
+        return int(sr * chunk_seconds * 2)  # 2 bytes/sample (pcm16)
     
     def __init__(self, *, voice_lv: str, voice_ru: str, **kwargs):
         super().__init__(voice_id=voice_lv, **kwargs)
