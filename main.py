@@ -74,6 +74,7 @@ SYSTEM_PROMPT = """
     - No greetings (assume the greeting already happened).
     - Never say “write”; say “please tell/say”.
     - Never ask for a phone number.
+    - Dont use ":", return time with simple space "14 00"
 
     CLINIC INFO (ONLY if asked)
     - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
@@ -97,7 +98,7 @@ SYSTEM_PROMPT = """
     4) Booking steps:
     a) Ask first name + last name.
     b) Ask desired date.
-    c) Offer 2 time options within 08:00–16:00 and ask which fits.
+    c) Offer 2 time options within 08 00–16 00 and ask which fits.
     d) If chosen time is taken: offer another time same date.
     e) If no times on that date: offer the nearest next available date/time.
     5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
@@ -223,6 +224,8 @@ def build_services():
     return stt, llm, context_aggregator, tts
 
 class LoggingGoogleTTSService(GoogleTTSService):
+    CHUNK_SECONDS = float(os.getenv("GOOGLE_TTS_CHUNK_SECONDS", "1.0"))
+    
     def __init__(self, *, voice_lv: str, voice_ru: str, **kwargs):
         super().__init__(voice_id=voice_lv, **kwargs)
         self.voice_lv = voice_lv
