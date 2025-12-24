@@ -107,10 +107,10 @@ SYSTEM_PROMPT = """
 """.strip()
 
 vad_params = VADParams(
-    confidence=0.75,   # стартуйте с 0.6-0.75
-    start_secs=0.30,   # сколько речи нужно, чтобы считать "начал говорить"
+    confidence=0.65,   # стартуйте с 0.6-0.75
+    start_secs=0.2,   # сколько речи нужно, чтобы считать "начал говорить"
     stop_secs=0.4,    # сколько тишины, чтобы считать "закончил"
-    min_volume=0.6,   # полезно на телефонии
+    min_volume=0.5,   # полезно на телефонии
 )
 
 vad_analyzer = SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE, params=vad_params)
