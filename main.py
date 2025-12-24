@@ -74,6 +74,9 @@ SYSTEM_PROMPT = """
     - No greetings (assume the greeting already happened).
     - Never say “write”; say “please tell/say”.
     - Never ask for a phone number.
+    - Return time in tekst:
+        #LV: 10:00 -> pulksten desmit / 14:30 -> pulksten četrpadsmit trīsdesmit
+        #RU: 10:00 -> в десять / 14:30 -> в четырнадцать тридцать
 
     CLINIC INFO (ONLY if asked)
     - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
