@@ -1,5 +1,7 @@
 import os
 import logging
+import re
+import time
 
 from fastapi import FastAPI, WebSocket, Request, Form
 from fastapi.responses import Response
@@ -24,13 +26,13 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.interruptions.min_words_interruption_strategy import MinWordsInterruptionStrategy
-from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame
-
-import re
+from pipecat.frames.frames import TTSSpeakFrame, TTSUpdateSettingsFrame, TTSAudioRawFrame
 
 INTRO_LV = "Labdien, AM Dental Studio, kā varu palīdzēt?"
 
 CYR = re.compile(r"[А-Яа-яЁё]")
+
+TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("twilio-pipecat")
@@ -112,6 +114,17 @@ vad_params = VADParams(
 )
 
 vad_analyzer = SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE, params=vad_params)
+
+def normalize_times_for_tts(text: str) -> str:
+    # Убираем двоеточие: "14:30" -> "14 30", "10:00" -> "10"
+    def repl(m: re.Match) -> str:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if mm == 0:
+            return f"{hh}"
+        return f"{hh} {mm:02d}"
+    return TIME_RE.sub(repl, text)
+
 
 def twilio_serializer_params() -> TwilioFrameSerializer.InputParams:
     """
@@ -201,25 +214,30 @@ def build_services():
     return stt, llm, context_aggregator, tts
 
 class LoggingGoogleTTSService(GoogleTTSService):
-    @property
-    def chunk_size(self) -> int:
-        # сколько секунд буфера хотим накопить до первого аудио-фрейма
-        chunk_seconds = 1.5
-
-        # В Pipecat TTS обычно отдаёт raw pcm16 => 2 bytes per sample, 1 channel
-        sr = self.sample_rate  # у вас это OUT_SR (24000)
-        return int(sr * chunk_seconds * 2)
-
     def __init__(self, *, voice_lv: str, voice_ru: str, **kwargs):
         super().__init__(voice_id=voice_lv, **kwargs)
         self.voice_lv = voice_lv
         self.voice_ru = voice_ru
 
-    async def run_tts(self, text: str):
-        logger.info("GoogleTTS chunk_size=%d bytes (%.2fs)",
-                    self.chunk_size,
-                    self.chunk_size / (2 * self.sample_rate))
+        # Настройки чанков
+        self._chunk_short = float(os.getenv("GOOGLE_TTS_CHUNK_SECONDS_SHORT", "1.2"))
+        self._chunk_long  = float(os.getenv("GOOGLE_TTS_CHUNK_SECONDS_LONG", "0.7"))
+        self._long_text_chars = int(os.getenv("GOOGLE_TTS_LONG_TEXT_CHARS", "45"))
+        self._chunk_seconds = self._chunk_long  # дефолт
 
+    @property
+    def chunk_size(self) -> int:
+        sr = self.sample_rate
+        return int(sr * self._chunk_seconds * 2)  # pcm16 mono
+
+    async def run_tts(self, text: str):
+        # Выбираем размер чанка под длину текста
+        self._chunk_seconds = self._chunk_short if len(text) <= self._long_text_chars else self._chunk_long
+
+        # Нормализуем время, чтобы не было пауз на ":"
+        text = normalize_times_for_tts(text)
+
+        # Выбор языка/голоса
         if CYR.search(text):
             self.set_voice(self.voice_ru)
             await self._update_settings({"language": Language.RU})
@@ -227,12 +245,25 @@ class LoggingGoogleTTSService(GoogleTTSService):
             self.set_voice(self.voice_lv)
             await self._update_settings({"language": Language.LV})
 
+        logger.info(
+            "GoogleTTS chunk_seconds=%.2f chunk_size=%d bytes (%.2fs)",
+            self._chunk_seconds,
+            self.chunk_size,
+            self.chunk_size / (2 * self.sample_rate),
+        )
         logger.info("GPT reply -> Google TTS: %s", text)
 
+        # (опционально) диагностика задержек между фреймами
+        last = time.monotonic()
         started = False
         async for frame in super().run_tts(text):
-            if isinstance(frame, TTSAudioRawFrame) and not started:
-                logger.info("Google TTS started streaming audio")
+            if isinstance(frame, TTSAudioRawFrame):
+                now = time.monotonic()
+                gap = now - last
+                dur = len(frame.audio) / (2 * frame.sample_rate)
+                if started and gap > dur + 0.05:
+                    logger.warning("Underrun risk: gap=%.3fs frame_dur=%.3fs", gap, dur)
+                last = now
                 started = True
             yield frame
 
