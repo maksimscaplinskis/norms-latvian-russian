@@ -107,10 +107,10 @@ SYSTEM_PROMPT = """
 """.strip()
 
 vad_params = VADParams(
-    confidence=0.7,   # стартуйте с 0.6-0.75
-    start_secs=0.25,   # сколько речи нужно, чтобы считать "начал говорить"
+    confidence=0.75,   # стартуйте с 0.6-0.75
+    start_secs=0.30,   # сколько речи нужно, чтобы считать "начал говорить"
     stop_secs=0.4,    # сколько тишины, чтобы считать "закончил"
-    min_volume=0.5,   # полезно на телефонии
+    min_volume=0.6,   # полезно на телефонии
 )
 
 vad_analyzer = SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE, params=vad_params)
@@ -192,18 +192,18 @@ def build_services():
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
     context_aggregator = LLMContextAggregatorPair(context)
 
-    class LoggingElevenLabsTTSService(ElevenLabsTTSService):
-        async def run_tts(self, text: str):
-            logger.info("GPT reply -> TTS: %s", text)
-            started = False
-            try:
-                async for frame in super().run_tts(text):
-                    if isinstance(frame, TTSAudioRawFrame) and not started:
-                        logger.info("ElevenLabs started streaming audio")
-                        started = True
-                    yield frame
-            finally:
-                logger.info("ElevenLabs finished for text")
+    # class LoggingElevenLabsTTSService(ElevenLabsTTSService):
+    #     async def run_tts(self, text: str):
+    #         logger.info("GPT reply -> TTS: %s", text)
+    #         started = False
+    #         try:
+    #             async for frame in super().run_tts(text):
+    #                 if isinstance(frame, TTSAudioRawFrame) and not started:
+    #                     logger.info("ElevenLabs started streaming audio")
+    #                     started = True
+    #                 yield frame
+    #         finally:
+    #             logger.info("ElevenLabs finished for text")
 
     # tts = LoggingElevenLabsTTSService(
     #     api_key=ELEVENLABS_API_KEY,
