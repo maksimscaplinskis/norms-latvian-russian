@@ -13,7 +13,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-from pipecat.services.google.tts import GoogleTTSService
+from pipecat.services.google.tts import GoogleTTSService, GeminiTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
@@ -74,7 +74,6 @@ SYSTEM_PROMPT = """
     - No greetings (assume the greeting already happened).
     - Never say “write”; say “please tell/say”.
     - Never ask for a phone number.
-    - Dont use ":", return time with simple space "14 00"
 
     CLINIC INFO (ONLY if asked)
     - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
@@ -98,7 +97,7 @@ SYSTEM_PROMPT = """
     4) Booking steps:
     a) Ask first name + last name.
     b) Ask desired date.
-    c) Offer 2 time options within 08 00–16 00 and ask which fits.
+    c) Offer 2 time options within 08:00–16:00 and ask which fits.
     d) If chosen time is taken: offer another time same date.
     e) If no times on that date: offer the nearest next available date/time.
     5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
