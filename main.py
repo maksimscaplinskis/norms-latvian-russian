@@ -42,8 +42,6 @@ OUT_SR = 24000
 
 PIPELINE_SAMPLE_RATE = IN_SR
 
-silence_80ms = b"\x00" * int(OUT_SR * 0.08 * 2)  # 2 bytes/sample (pcm16)
-
 SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 SONIOX_MODEL = os.getenv("SONIOX_MODEL", "stt-rt-v3")
 
@@ -74,10 +72,9 @@ SYSTEM_PROMPT = """
     - No greetings (assume the greeting already happened).
     - Never say “write”; say “please tell/say”.
     - Never ask for a phone number.
-    - Dont use ":", return time with simple space "14 00"
 
     CLINIC INFO (ONLY if asked)
-    - Hours: Mon–Fri 08 00–16 00; weekends — by appointment.
+    - Hours: Mon–Fri 08:00–16:00; weekends — by appointment.
     - Services: treatment, hygiene, prosthetics, implants, surgery, aligners/caps, adults and children.
     - Prices: “Exact price depends on your case; the dentist will confirm at consultation.”
     - Address: Rēzekne, Latgales iela 93.
@@ -98,7 +95,7 @@ SYSTEM_PROMPT = """
     4) Booking steps:
     a) Ask first name + last name.
     b) Ask desired date.
-    c) Offer 2 time options within 08 00–16 00 and ask which fits.
+    c) Offer 2 time options and ask which fits.
     d) If chosen time is taken: offer another time same date.
     e) If no times on that date: offer the nearest next available date/time.
     5) Closing: confirm date, time, reason, “AM Dental Studio”, and end politely.
@@ -109,7 +106,7 @@ SYSTEM_PROMPT = """
 
 vad_params = VADParams(
     confidence=0.65,   # стартуйте с 0.6-0.75
-    start_secs=0.2,   # сколько речи нужно, чтобы считать "начал говорить"
+    start_secs=0.25,   # сколько речи нужно, чтобы считать "начал говорить"
     stop_secs=0.4,    # сколько тишины, чтобы считать "закончил"
     min_volume=0.5,   # полезно на телефонии
 )
@@ -193,26 +190,6 @@ def build_services():
     context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
     context_aggregator = LLMContextAggregatorPair(context)
 
-    # class LoggingElevenLabsTTSService(ElevenLabsTTSService):
-    #     async def run_tts(self, text: str):
-    #         logger.info("GPT reply -> TTS: %s", text)
-    #         started = False
-    #         try:
-    #             async for frame in super().run_tts(text):
-    #                 if isinstance(frame, TTSAudioRawFrame) and not started:
-    #                     logger.info("ElevenLabs started streaming audio")
-    #                     started = True
-    #                 yield frame
-    #         finally:
-    #             logger.info("ElevenLabs finished for text")
-
-    # tts = LoggingElevenLabsTTSService(
-    #     api_key=ELEVENLABS_API_KEY,
-    #     voice_id=ELEVENLABS_VOICE_ID,
-    #     model=ELEVENLABS_MODEL_ID,
-    #     sample_rate=PIPELINE_SAMPLE_RATE,
-    # )
-
     tts = LoggingGoogleTTSService(
         credentials=os.environ["GCP_SA_JSON"],
         voice_lv=GOOGLE_TTS_VOICE_LV,
@@ -226,17 +203,23 @@ def build_services():
 class LoggingGoogleTTSService(GoogleTTSService):
     @property
     def chunk_size(self) -> int:
-        chunk_seconds = 1.2
-        # sample_rate становится >0 после start(); до этого можно опереться на _init_sample_rate
-        sr = self.sample_rate or getattr(self, "_init_sample_rate", 0) or OUT_SR
-        return int(sr * chunk_seconds * 2)  # 2 bytes/sample (pcm16)
-    
+        # сколько секунд буфера хотим накопить до первого аудио-фрейма
+        chunk_seconds = 1.5
+
+        # В Pipecat TTS обычно отдаёт raw pcm16 => 2 bytes per sample, 1 channel
+        sr = self.sample_rate  # у вас это OUT_SR (24000)
+        return int(sr * chunk_seconds * 2)
+
     def __init__(self, *, voice_lv: str, voice_ru: str, **kwargs):
         super().__init__(voice_id=voice_lv, **kwargs)
         self.voice_lv = voice_lv
         self.voice_ru = voice_ru
 
     async def run_tts(self, text: str):
+        logger.info("GoogleTTS chunk_size=%d bytes (%.2fs)",
+                    self.chunk_size,
+                    self.chunk_size / (2 * self.sample_rate))
+
         if CYR.search(text):
             self.set_voice(self.voice_ru)
             await self._update_settings({"language": Language.RU})
@@ -252,6 +235,7 @@ class LoggingGoogleTTSService(GoogleTTSService):
                 logger.info("Google TTS started streaming audio")
                 started = True
             yield frame
+
         logger.info("Google TTS finished for text")
 
 class FrameLogObserver(BaseObserver):
@@ -301,7 +285,6 @@ def build_pipeline(
     @transport.event_handler("on_client_connected")
     async def _on_client_connected(_transport, _client):
         await task.queue_frames([
-            TTSAudioRawFrame(silence_80ms, OUT_SR, 1),
             TTSUpdateSettingsFrame({"language": Language.LV}),
             TTSSpeakFrame(INTRO_LV),
         ])
